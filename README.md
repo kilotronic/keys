@@ -185,6 +185,9 @@ Phase 2, from the design:
   `twilio-key`, `azure-app-secret`, and `generated` (a random signing secret, with `mint`).
 - Probes for Railway, Resend and Twilio, and the old checker's Key Vault and gitleaks-report
   sources, so the old scripts can become thin shims and then be deleted.
+- One shared "does this text look like a value?" test. Today the same question is answered
+  in four places (unknown mapping keys, `keys new`'s flag checks, scan's file names and
+  patterns, and check's error-code filter), each a little differently.
 - The schedules: the nightly CI run with an issue from day 120, and a daily launchd `keys scan`
   on the Mac.
 - A check, once, that `op item create` keeps the empty non-secret fields `keys new` asks for
