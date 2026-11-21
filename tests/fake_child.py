@@ -110,6 +110,8 @@ def main(prog: str, argv: list[str]) -> int:
         if [prog, *words][: len(fail["words"])] == fail["words"]:
             print(fail.get("stderr", ""), file=sys.stderr)
             return int(fail["code"])
+    if prog == "az" and words[:3] == ["keyvault", "secret", "show"]:
+        return _az_show(db, argv)
     if prog != "op":
         code = targets(prog, words, flags, stdin, db)
         if code is None:
@@ -292,6 +294,26 @@ def targets(
         print(json.dumps(rows))
         return 0
     return None
+
+
+def _az_show(db: dict[str, Any], argv: list[str]) -> int:
+    """`az keyvault secret show --vault-name V --name N --query value --output json|tsv`: the
+    value as az prints it (a JSON string, or null; or the text and a newline), from the values
+    the harness set for kv://V/N."""
+    flags = dict(zip(argv[3::2], argv[4::2], strict=False))
+    ref = f"kv://{flags.get('--vault-name')}/{flags.get('--name')}"
+    if ref in db["fail"]:
+        sys.stdout.write(db["fail"][ref].get("stdout", ""))
+        print(db["fail"][ref]["stderr"], file=sys.stderr)
+        return int(db["fail"][ref]["code"])
+    if ref not in db["values"] or flags.get("--query") != "value":
+        print("fake az: (SecretNotFound) not found", file=sys.stderr)
+        return 3
+    if flags.get("--output") == "json":
+        print(json.dumps(db["values"][ref], indent=2))
+    else:
+        sys.stdout.write(f"{db['values'][ref]}\n")
+    return 0
 
 
 if __name__ == "__main__":

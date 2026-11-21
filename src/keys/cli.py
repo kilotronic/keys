@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, NoReturn
 if TYPE_CHECKING:
     from _typeshed import SupportsWrite
 
-from keys import checking, creating, listing, scanning, syncing
+from keys import checking, creating, fpcmd, listing, scanning, syncing
 from keys.context import (
     EXIT_INTERNAL,
     EXIT_OK,
@@ -92,6 +92,12 @@ def _parser(ctx: Context, argv: Sequence[str]) -> _Parser:
         add("new", "make an empty 1Password item for a credential and its mapping entry")
     )
     syncing.configure(add("sync", "write 1Password's value to every target in the mapping file"))
+    fpcmd.configure_fp(
+        add("fp", "a credential's keyed fingerprint, and its hint for a provider's key")
+    )
+    fpcmd.configure_leaks(
+        add("leaks", "each leaked value in a gitleaks report, by fingerprint, never the value")
+    )
     return top
 
 
@@ -112,6 +118,10 @@ def run(argv: Sequence[str], ctx: Context) -> int:
         return creating.run(args, ctx)
     if command == "sync":
         return syncing.run(args, ctx)
+    if command == "fp":
+        return fpcmd.fp(args, ctx)
+    if command == "leaks":
+        return fpcmd.report(args, ctx)
     raise UsageError(f"keys {command} is not built yet")
 
 

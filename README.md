@@ -4,7 +4,7 @@ A small command-line tool for the owner's credentials that never prints, logs or
 credential's value. It reads values from 1Password in memory, passes them only on stdin or in a
 child's environment, and prints names, fingerprints, dates and verdicts.
 
-Phase 1 of the design (list, check, scan, scrub and new), and from phase 2, sync. `keys list` and the `generic` kind
+Phase 1 of the design (list, check, scan, scrub and new), and from phase 2, sync, fp and leaks (the last two taken over from the old key checker). `keys list` and the `generic` kind
 are additions to the design's lists. See [What is next](#what-is-next).
 
 ## The mapping file
@@ -68,8 +68,12 @@ $ keys check github --key op://<vault>/<item>/credential --expect dead
 github key fp:3f9a1c02 github_p…Ab3d: DEAD (HTTP 401 from api.github.com/rate_limit)
 ```
 
-- The key comes from `op://…` (read in memory through 1Password), `env:NAME` or `stdin`, never
-  the command line. A source keys does not know is not repeated back.
+- The key comes from `op://…` (read in memory through 1Password), `kv://<vault>/<secret>` (read
+  in memory through `az keyvault secret show` under the owner's az sign-in), `env:NAME`, `stdin`,
+  or `gitleaks:<report.json>#<fingerprint>` (the one leaked value in an unredacted gitleaks
+  report whose keyed fingerprint starts with those digits, so a leaked key can be proved dead
+  without anyone handling it), never the command line. A source keys does not know is not
+  repeated back. The fingerprint secret takes only `op://…`, `env:NAME` or `stdin`.
 - `fp:` is the first 8 hex digits of an HMAC-SHA-256 keyed by a fingerprint secret, from
   `--fp-key` or `$KEYS_FP_KEY` (same source forms), so a short key cannot be guessed from it.
 - Nothing a service or a program says is passed through: only the status, an error code that
@@ -82,6 +86,36 @@ github key fp:3f9a1c02 github_p…Ab3d: DEAD (HTTP 401 from api.github.com/rate_
   `--header 'Name: {key}'`, `--bearer` or `--query NAME`).
 - Exit 0 for WORKS (or the `--expect` verdict), 1 for DEAD (or the other), 2 for UNKNOWN, 3 for
   a usage error.
+
+### `keys fp <name>` and `keys fp --key <source>`
+
+The keyed fingerprint of a mapped credential's value, read from 1Password in memory, and for a key
+a provider issued the hint its console shows; then whether it matches the mapping file's `fp`
+(exit 1 when it differs). `--key` takes any source `keys check` takes and prints only `fp:`, and
+with `--hint` also the start and end a provider's console shows (only for a key a provider issued).
+
+```text
+$ keys fp deploy
+deploy cloudflare-token fp:1a2b3c4d Ab3dEf6h…Wx3Q: matches the mapping file
+$ keys fp --key kv://app-kv/mail-key
+fp:9c0e7d21
+```
+
+### `keys leaks <report.json>`
+
+One line per distinct leaked value in a gitleaks JSON report made without `--redact`: its keyed
+fingerprint, the rule, the first file (and how many more), how many findings and commits, the
+first commit and the date range. Never the `Secret`, `Match` or `Line` fields; a file name, rule,
+commit or date that looks like a value, or holds a piece of a leaked one, is withheld. A
+redacted report is refused (it holds nothing to fingerprint). Exit 1 when the report holds any
+leak. Then `keys check <service> --key gitleaks:<report.json>#<fp> --expect dead` for each, and
+delete the report.
+
+```text
+$ keys leaks report.json
+fp:3f9a1c02  github-pat  src/settings.py (+2 more)  4 findings in 3 commits, first 1a2b3c4d, 2025-01-02..2025-03-04
+keys leaks: 1 leaked value in 4 findings
+```
 
 ### `keys scan`
 
@@ -198,6 +232,36 @@ keys sync: 2 targets written for 1 credential
   proven against a real project: that a redeploy picks up variables staged with
   `--skip-deploys`, and that `railway deployment list --json` lists the newest first.
 
+## Shim for check_key.py
+
+The old key checker, `check_key.py`, becomes a thin shim that runs `keys`. Its
+arguments map one to one:
+
+| check_key.py                         | keys                                            |
+| ------------------------------------ | ----------------------------------------------- |
+| `providers`                          | `keys check --list`                             |
+| `fingerprint --key <source>`         | `keys fp --key <source> --hint`                 |
+| `leaks <report.json>`                | `keys leaks <report.json>`                      |
+| `<service> --key <source> [options]` | `keys check <service> --key <source> [options]` |
+
+Sources `op://`, `kv://`, `env:`, `stdin` and `gitleaks:` carry over. Not carried over, on
+purpose: `file:PATH` (keys never reads a key from a file the caller names, since a key file is
+itself a copy to leak) and `prompt` (a hidden prompt is typed into a terminal an agent may be
+reading; paste the key into 1Password instead and use `op://`). The shim should refuse both with that
+advice. What else differs:
+
+- **The fingerprint secret.** keys needs it (`--fp-key` or `$KEYS_FP_KEY`). The shim
+  sets `KEYS_FP_KEY` to its 1Password reference (`op://…`) when the caller has not set it, so
+  existing calls keep working.
+- **Keyed fingerprints.** `fp:` is keyed, so it will not match the unkeyed SHA-256 fingerprints
+  check_key.py printed in old issues, nor a `gitleaks:` fingerprint taken from one.
+- **`leaks` exits 1 when the report holds any leak** (check_key.py exited 0), and ends with a
+  summary line, `keys leaks: N leaked values in M findings`. A finding gitleaks made outside git
+  says `not in git` in place of the commit and dates.
+- **No length.** check_key.py's `(N chars)` is no longer printed.
+- **Key Vault values are read exactly** (as JSON), so a value's own trailing newline is kept;
+  check_key.py dropped it.
+
 ## Does this text look like a value?
 
 One module, `keys.looks`, answers it for every place keys might repeat text. Text looks like a
@@ -260,14 +324,14 @@ Phase 2, from the design:
   over the Railway, signing-secret, datastore and Twilio rotation of the script it replaces.
 - Revoke by API where the provider has one; otherwise open the provider's page for the owner.
 - `keys check --all [--deep]` against the targets: in sync, unmapped secrets, and 1Password items
-  not updated in 180 days; `keys fp <name>`.
+  not updated in 180 days.
 - The gitleaks pass in `keys scan`, with the shared secret-scan rules and `--redact`, and a
   scan of only the files changed since the last run, for speed.
 - `keys rotate --dry-run` and `--now`.
 - The design's other starting kinds: `railway-workspace-token`, `openai-key`, `resend-key`,
   `twilio-key`, `azure-app-secret`, and `generated` (a random signing secret, with `mint`).
-- Probes for Railway, Resend and Twilio, and the old checker's Key Vault and gitleaks-report
-  sources, so the old scripts can become thin shims and then be deleted.
+- Probes for Railway, Resend and Twilio, so the old rotation script can become a thin shim and
+  then be deleted.
 - The schedules: the nightly CI run with an issue from day 120, and a daily launchd `keys scan`
   on the Mac.
 - A check, once, that `op item create` keeps the empty non-secret fields `keys new` asks for
