@@ -116,12 +116,17 @@ def main(prog: str, argv: list[str]) -> int:
         if [prog, *words][: len(odd["words"])] == odd["words"]:
             print(odd["stdout"])
             return 0
+    late: dict[str, Any] | None = None
     for fail in db.get("child_fail", []):
         if [prog, *words][: len(fail["words"])] == fail["words"]:
             if int(fail.get("skip", 0)) > 0:  # let this many matching calls through first
                 fail["skip"] = int(fail["skip"]) - 1
                 _save(db)
                 continue
+            if fail.get("after"):  # the call takes effect, then reports a failure, once
+                late = fail
+                db["child_fail"].remove(fail)
+                break
             print(fail.get("stderr", ""), file=sys.stderr)
             return int(fail["code"])
     if prog == "az" and words[:3] == ["keyvault", "secret", "show"]:
@@ -134,6 +139,9 @@ def main(prog: str, argv: list[str]) -> int:
             print(f"fake {prog}: no answer for this call", file=sys.stderr)
             return 64
         _save(db)
+        if late is not None:
+            print(late.get("stderr", ""), file=sys.stderr)
+            return int(late["code"])
         return code
     if words[:1] == ["read"] and len(words) == 2:
         ref = words[1]
@@ -166,6 +174,15 @@ def main(prog: str, argv: list[str]) -> int:
         if item is None or flags.get("--format") != "json":
             print("[ERROR] item not found", file=sys.stderr)
             return 1
+        race = db.get("item_step_race")
+        if race and race["title"] == words[2] and not race.get("done"):
+            race["gets"] = int(race.get("gets", 0)) + 1
+            if race["gets"] >= 2:  # another run moved the item on since this one read it
+                race["done"] = True
+                fields = [f for f in item["fields"] if f.get("label") != "keys_step"]
+                fields.append({"id": "keys_step", "label": "keys_step", "value": race["step"]})
+                item["fields"] = fields
+            _save(db)
         print(json.dumps(item))
         return 0
     if edit and len(words) == 3:
@@ -304,10 +321,12 @@ def targets(
                 "ref": _flag(flags, "--ref"),
             },
         )
+        for other in db.pop("runs_on_dispatch", []):  # someone else's, started just after
+            runs.insert(0, {"databaseId": len(runs) + 100, **other})
         return 0
     if w[:3] == ["gh", "run", "list"]:
         rows = [
-            {"databaseId": r["databaseId"], "event": r["event"]}
+            {"databaseId": r["databaseId"], "event": r["event"], "headBranch": r["ref"]}
             for r in db.get("runs", [])
             if r["workflow"] == _flag(flags, "--workflow") and r["repo"] == _flag(flags, "--repo")
         ]

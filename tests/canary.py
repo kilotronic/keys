@@ -43,7 +43,7 @@ import traceback
 from collections.abc import Callable, Generator, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import quote, quote_plus
 
 import pytest
@@ -220,6 +220,8 @@ class Canary:
         )
         self.planted: dict[Path, str] = {}
         self.extra_values: list[str] = []
+        # Values no target may ever receive (a minting key): a write of one fails the test.
+        self.never_written: list[str] = []
 
     # ------------------------------------------------------------------ setting the scene
 
@@ -309,12 +311,21 @@ class Canary:
         self.db.setdefault("child_print", []).append({"words": words, "stdout": stdout})
         self._save_db()
 
-    def child_fails(self, words: list[str], code: int = 1, *, skip: int = 0) -> None:
+    def child_fails(
+        self, words: list[str], code: int = 1, *, skip: int = 0, after: bool = False
+    ) -> None:
         """A fake child whose program and leading words are these fails with code, after the
-        first `skip` such calls succeed; its error text holds the canary."""
+        first `skip` such calls succeed; its error text holds the canary. With `after`, a
+        target call takes effect first and then fails (a write that timed out but landed)."""
         self._load_db()
         self.db.setdefault("child_fail", []).append(
-            {"words": words, "code": code, "stderr": f"error: {self.value}", "skip": skip}
+            {
+                "words": words,
+                "code": code,
+                "stderr": f"error: {self.value}",
+                "skip": skip,
+                "after": after,
+            }
         )
         self._save_db()
 
@@ -626,6 +637,8 @@ class Canary:
     def _expected_write(self, data: str, held: list[str]) -> bool:
         """A target write carries exactly one value 1Password held (the canary, an op_value or
         an item field), as read or with its trailing line breaks removed (keys's one change)."""
+        if any(data in (v, v.rstrip("\n")) for v in self.never_written):
+            return False
         return any(data in (v, v.rstrip("\n")) for v in held)
 
     def secrets(self) -> list[str]:
@@ -647,6 +660,8 @@ class Canary:
             if not stdin_ok(c.argv) or any(words[: len(w)] == w for w in ITEM_WRITES):
                 if not stdin_ok(c.argv):
                     channels.append((f"stdin of {c.prog}", c.stdin.encode()))
+                else:
+                    channels += _plain_fields(c.stdin)
             elif c.stdin and not self._expected_write(c.stdin, held):
                 raise LeakError(f"the stdin of {c.prog} is not exactly one value 1Password holds")
             channels.append((f"argv of {c.prog}", "\0".join(c.argv).encode()))
@@ -732,6 +747,26 @@ class Canary:
                     except OSError as e:
                         refuse(e)
                     yield path
+
+
+def _plain_fields(stdin: str) -> list[tuple[str, bytes]]:
+    """The fields of an item write that are not concealed, and its other parts: a value may
+    sit only in a concealed field."""
+    try:
+        doc: object = json.loads(stdin)
+    except ValueError:
+        doc = None
+    if not isinstance(doc, dict):
+        return [("an op item write keys sent", stdin.encode())]
+    item = cast(dict[str, Any], doc)
+    out: list[tuple[str, bytes]] = []
+    for raw in cast(list[Any], item.get("fields") or []):
+        f = cast(dict[str, Any], raw) if isinstance(raw, dict) else {}
+        if f.get("type") != "CONCEALED":
+            out.append((f"plain field {f.get('label')!r} of an op item write", str(f).encode()))
+    rest = {k: v for k, v in item.items() if k != "fields"}
+    out.append(("the rest of an op item write", json.dumps(rest).encode()))
+    return out
 
 
 def _under(path: Path, root: Path) -> bool:

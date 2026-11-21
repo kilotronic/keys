@@ -91,6 +91,7 @@ def cf(canary: Canary) -> tuple[Canary, Providers]:
     minter = made_up("mint")
     c.op_item(VAULT, CF_ITEM, {"credential": CANARY, "token_id": "cf-old", "account_id": ""})
     c.op_item(VAULT, MINTER_ITEM, {"credential": minter, "token_id": "cf-mint", "account_id": ""})
+    c.never_written.append(minter)
     c.gh_main_only("owner/app", "production")
     c.target_put(GH_ENV, CANARY)
     c.target_put(KV, CANARY, tags={})
@@ -646,3 +647,317 @@ def test_a_kind_keys_cannot_rotate_is_refused(canary: Canary) -> None:
     result = c.run(["rotate", "x"], env=ENV)
     assert result.code == 3
     assert "cannot rotate" in result.stderr
+
+
+# ---------------------------------------------------------------------------- review: reruns
+
+
+def test_a_rerun_after_the_old_key_was_deleted_but_not_recorded_finishes(
+    cf: tuple[Canary, Providers],
+) -> None:
+    c, p = cf
+    # edits: pending, store, verified; the fourth (revoked) fails after the DELETE went through
+    c.child_fails(["op", "item", "edit"], code=5, skip=3)
+    first = rotate(c, p, "deploy")
+    assert first.code == 1
+    assert CANARY not in p.keys["cloudflare"]
+    c.clear_child_fails()
+    again = rotate(c, p, "deploy")
+    assert again.code == 0, again.stderr
+    assert entry(c, "deploy")["fp"] == fp(new_value(p))
+    assert not c.op_fields(VAULT, CF_ITEM)["previous"]
+
+
+def test_a_revoke_that_takes_effect_late_is_seen_on_the_rerun(
+    cf: tuple[Canary, Providers],
+) -> None:
+    c, p = cf
+    p.ignore_revoke = True
+    assert rotate(c, p, "deploy").code == 1
+    p.ignore_revoke = False
+    del p.keys["cloudflare"][CANARY]  # the provider caught up
+    again = rotate(c, p, "deploy")
+    assert again.code == 0, again.stderr
+    assert entry(c, "deploy")["fp"] == fp(new_value(p))
+
+
+def test_a_write_that_failed_but_landed_is_rolled_back_too(cf: tuple[Canary, Providers]) -> None:
+    c, p = cf
+    c.child_fails(["railway", "variable", "set"], code=7, after=True)
+    result = rotate(c, p, "deploy")
+    assert result.code == 1
+    assert "rolled back" in result.stderr
+    untouched(c, p)
+
+
+def test_an_unclear_probe_of_the_new_key_keeps_it_for_a_rerun(
+    cf: tuple[Canary, Providers],
+) -> None:
+    c, p = cf
+    p.fail("GET", f"{CF}/verify", 503)
+    first = rotate(c, p, "deploy")
+    assert first.code == 1
+    assert "rerun" in first.stderr
+    new = new_value(p)
+    assert new in p.keys["cloudflare"]  # not revoked
+    fields = c.op_fields(VAULT, CF_ITEM)
+    assert (fields["pending"], fields["keys_step"]) == (new, "pending")
+    del p.fails[("GET", f"{CF}/verify")]
+    again = rotate(c, p, "deploy")
+    assert again.code == 0, again.stderr
+    assert p.minted == [new]  # nothing minted twice
+
+
+def test_a_new_key_whose_revoke_fails_in_rollback_is_revoked_by_the_next_run(
+    cf: tuple[Canary, Providers],
+) -> None:
+    c, p = cf
+    c.child_fails(["railway", "variable", "set"], code=7)
+    p.fail("DELETE", f"{CF}/cl-new-1", 502)
+    first = rotate(c, p, "deploy")
+    assert first.code == 1
+    new = new_value(p)
+    assert new in p.keys["cloudflare"]
+    assert c.op_fields(VAULT, CF_ITEM)["unrevoked_id"] == "cl-new-1"
+    c.clear_child_fails()
+    del p.fails[("DELETE", f"{CF}/cl-new-1")]
+    again = rotate(c, p, "deploy")
+    assert again.code == 0, again.stderr
+    assert new not in p.keys["cloudflare"]  # the stray key went first
+    assert not c.op_fields(VAULT, CF_ITEM)["unrevoked_id"]
+    assert len(p.minted) == 2
+
+
+def test_an_item_changed_by_another_run_stops_the_save(cf: tuple[Canary, Providers]) -> None:
+    c, p = cf
+    # Another run moves the item on between this run's read and its first save.
+    c.set_db("item_step_race", {"title": CF_ITEM, "step": "pending"})
+    result = rotate(c, p, "deploy")
+    assert result.code == 1
+    assert "another keys rotate" in result.stderr
+    assert p.minted
+    assert p.minted[0] not in p.keys["cloudflare"]  # its own key is revoked
+
+
+# ---------------------------------------------------------------------------- review: first value
+
+
+def test_the_first_value_is_minted_into_an_empty_item(canary: Canary) -> None:
+    c = canary
+    c.watch(FP_KEY)
+    admin = made_up("re_admin")
+    item, admin_item = "resend-key app-mail", "resend-key resend-admin"
+    c.op_item(VAULT, item, {"credential": "", "key_id": "", "domain_id": "", "permission": ""})
+    c.op_item(VAULT, admin_item, {"credential": admin, "key_id": "re-admin"})
+    (c.work / "keys.toml").write_text(
+        f'[[credential]]\nname = "resend-admin"\nkind = "resend-key"\n'
+        f'item = "op://{VAULT}/{admin_item}"\nkept_because = "mints the sending keys"\n\n'
+        f'[[credential]]\nname = "app-mail"\nkind = "resend-key"\nitem = "op://{VAULT}/{item}"\n'
+        'minted_by = "resend-admin"\nkept_because = "Resend has no OIDC sign-in"\n\n'
+        '[[credential.target]]\ntype = "github-actions"\nrepo = "owner/app"\n'
+        'secret = "RESEND_API_KEY"\n'
+    )
+    p = Providers(c)
+    p.add("resend", admin, "re-admin", permission="full_access")
+    result = rotate(c, p, "app-mail")
+    assert result.code == 0, result.stderr
+    new = new_value(p)
+    assert c.target("gh:owner/app:RESEND_API_KEY")["value"] == new  # type: ignore[index]
+    assert "no old key to revoke" in result.stdout
+    assert c.op_fields(VAULT, item)["key_id"] == p.keys["resend"][new].ident
+
+
+def test_a_value_without_its_key_id_is_refused_before_anything_is_made(
+    cf: tuple[Canary, Providers],
+) -> None:
+    c, p = cf
+    c.op_set_field(VAULT, CF_ITEM, "token_id", "")
+    result = rotate(c, p, "deploy")
+    assert result.code == 1
+    assert "token_id" in result.stderr
+    assert p.minted == []
+
+
+# ---------------------------------------------------------------------------- review: checks
+
+
+def test_cloudflare_expiry_is_read_back_from_the_provider(cf: tuple[Canary, Providers]) -> None:
+    c, p = cf
+    p.cf_expires_on = f"{days(TODAY, 365)}T00:00:00Z"  # Cloudflare ignored the asked expiry
+    result = rotate(c, p, "deploy")
+    assert result.code == 1
+    assert "over 180" in result.stderr
+    assert c.op_fields(VAULT, CF_ITEM)["credential"] == CANARY
+
+
+def test_the_new_key_is_probed_again_before_the_old_one_goes(
+    pat: tuple[Canary, Providers],
+) -> None:
+    c, p = pat
+    assert rotate(c, p, "bot").code == 5
+    new = made_up("pat")
+    p.add("github", new, "pat-new", expires=days(TODAY, 180))
+    c.op_set_field(VAULT, PAT_ITEM, "pending", new)
+    assert rotate(c, p, "bot").code == 5  # waiting for the old token's revoke
+    del p.keys["github"][new]  # the owner deleted the wrong token
+    result = rotate(c, p, "bot")
+    assert result.code == 1
+    assert "the new key no longer works" in result.stderr
+
+
+def test_an_unclear_answer_about_the_old_key_is_not_called_still_working(
+    cf: tuple[Canary, Providers],
+) -> None:
+    c, p = cf
+    p.ignore_revoke = True
+    p.fail_after_delete = ("GET", f"{CF}/verify", 503)
+    result = rotate(c, p, "deploy")
+    assert result.code == 1
+    assert "cannot tell whether the old key" in result.stderr
+
+
+def test_a_hand_edited_expiry_field_is_not_printed(cf: tuple[Canary, Providers]) -> None:
+    c, p = cf
+    c.child_fails(["op", "item", "edit"], code=5, skip=3)
+    assert rotate(c, p, "deploy").code == 1
+    c.clear_child_fails()
+    c.op_set_field(VAULT, CF_ITEM, "keys_expires", CANARY)
+    result = rotate(c, p, "deploy")
+    assert result.code == 1
+    assert "keys_expires" in result.stderr
+
+
+def test_permissions_cannot_override_the_token_page_settings(canary: Canary) -> None:
+    from keys import mapping, rotators
+
+    c = mapping.Credential(
+        "bot",
+        "github-pat",
+        "V",
+        "github-pat bot",
+        owner="example-org",
+        permissions={"expires_in": "admin", "contents": "read"},
+    )
+    page = rotators.GitHubPat("github-pat", "github").create_page(c, {}, "bot 2026-11-21")
+    assert "expires_in=180" in page
+    assert "expires_in=admin" not in page
+
+
+def test_a_plain_text_pending_field_becomes_concealed() -> None:
+    from keys.op import set_fields
+
+    item = {"fields": [{"id": "pending", "label": "pending", "type": "STRING", "value": ""}]}
+    set_fields(item, {"pending": "x"}, {"pending"})
+    assert item["fields"][0]["type"] == "CONCEALED"
+
+
+def test_only_a_dispatch_on_main_is_watched(canary: Canary) -> None:
+    c = canary
+    c.watch(FP_KEY)
+    minter = made_up("mint")
+    c.op_item(VAULT, CF_ITEM, {"credential": CANARY, "token_id": "cf-old", "account_id": ""})
+    c.op_item(VAULT, MINTER_ITEM, {"credential": minter, "token_id": "cf-mint", "account_id": ""})
+    (c.work / "keys.toml").write_text(
+        CF_MAPPING.split("[[credential.target]]")[0]
+        + '[[credential.target]]\ntype = "github-actions"\nrepo = "owner/app"\nsecret = "CF"\n'
+        'verify = { workflow = "deploy.yml" }\n'
+    )
+    p = Providers(c)
+    p.add("cloudflare", CANARY, "cf-old", policies=POLICIES)
+    p.add("cloudflare", minter, "cf-mint", can_mint=True)
+    # Someone else's dispatch on another branch appears first.
+    c.set_db(
+        "runs_on_dispatch",
+        [
+            {
+                "event": "workflow_dispatch",
+                "workflow": "deploy.yml",
+                "repo": "owner/app",
+                "ref": "dev",
+            }
+        ],
+    )
+    result = rotate(c, p, "deploy")
+    assert result.code == 0, result.stderr
+    watched = [ch.argv[3] for ch in c.children() if ch.argv[:3] == ["gh", "run", "watch"]]
+    assert watched == ["100"]
+
+
+# ---------------------------------------------------------------------------- review: more paths
+
+
+def test_a_rollback_that_cannot_restore_a_target_keeps_the_new_key(
+    cf: tuple[Canary, Providers],
+) -> None:
+    c, p = cf
+    c.child_fails(["railway", "variable", "set"], code=7)
+    c.child_fails(["gh", "secret", "set"], code=8, skip=1)  # the rollback write fails
+    result = rotate(c, p, "deploy")
+    assert result.code == 1
+    assert "could not be put back" in result.stderr
+    new = new_value(p)
+    assert new in p.keys["cloudflare"]
+    fields = c.op_fields(VAULT, CF_ITEM)
+    assert (fields["credential"], fields["previous"]) == (new, CANARY)
+
+
+def test_a_rollback_whose_1password_save_fails_says_where_the_old_key_is(
+    cf: tuple[Canary, Providers],
+) -> None:
+    c, p = cf
+    c.child_fails(["railway", "variable", "set"], code=7)
+    c.child_fails(["op", "item", "edit"], code=5, skip=2)  # pending, store; then rollback's
+    result = rotate(c, p, "deploy")
+    assert result.code == 1
+    assert "previous field" in result.stderr
+    for key in (GH_ENV, KV, RW):
+        assert c.target(key)["value"] == CANARY  # type: ignore[index]
+
+
+def test_a_failed_redeploy_in_verify_rolls_back(cf: tuple[Canary, Providers]) -> None:
+    c, p = cf
+    c.child_fails(["railway", "redeploy"], code=9)
+    result = rotate(c, p, "deploy")
+    assert result.code == 1
+    assert "6 verify" in result.stderr
+    for key in (GH_ENV, KV):
+        assert c.target(key)["value"] == CANARY  # type: ignore[index]
+    assert c.op_fields(VAULT, CF_ITEM)["credential"] == CANARY
+
+
+def test_a_keys_step_keys_did_not_write_stops_it(cf: tuple[Canary, Providers]) -> None:
+    c, p = cf
+    c.op_set_field(VAULT, CF_ITEM, "keys_step", "half-done")
+    result = rotate(c, p, "deploy")
+    assert result.code == 1
+    assert "keys_step" in result.stderr
+    assert p.minted == []
+
+
+def test_a_pending_value_keys_did_not_leave_stops_it(cf: tuple[Canary, Providers]) -> None:
+    c, p = cf
+    c.op_set_field(VAULT, CF_ITEM, "pending", made_up("stray"))
+    result = rotate(c, p, "deploy")
+    assert result.code == 1
+    assert "did not leave there" in result.stderr
+    assert p.minted == []
+
+
+def test_a_pasted_value_with_a_carriage_return_is_refused(pat: tuple[Canary, Providers]) -> None:
+    c, p = pat
+    assert rotate(c, p, "bot").code == 5
+    new = made_up("pat")
+    p.add("github", new, "pat-new", expires=days(TODAY, 180))
+    c.op_set_field(VAULT, PAT_ITEM, "pending", new + "\r\n")
+    result = rotate(c, p, "bot")
+    assert result.code == 3
+    assert "carriage return" in result.stderr
+    assert c.target("gh:example-org/app:BOT_TOKEN")["value"] == CANARY  # type: ignore[index]
+
+
+def test_the_harness_refuses_a_minting_key_at_a_target(cf: tuple[Canary, Providers]) -> None:
+    c, _ = cf
+    minter = c.op_fields(VAULT, MINTER_ITEM)["credential"]
+    held = c._held([])  # pyright: ignore[reportPrivateUsage]
+    assert c._expected_write(CANARY, held)  # pyright: ignore[reportPrivateUsage]
+    assert not c._expected_write(minter, held)  # pyright: ignore[reportPrivateUsage]

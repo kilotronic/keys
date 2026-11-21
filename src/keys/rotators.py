@@ -32,6 +32,10 @@ Send = Callable[[str, str, dict[str, str], bytes | None], probes.Answer]
 class RotateError(Exception):
     """A provider call failed. The message names host, path, status and code only."""
 
+    def __init__(self, text: str, status: int = 0) -> None:
+        super().__init__(text)
+        self.status = status  # the HTTP status, when the provider answered
+
 
 @dataclass(frozen=True)
 class Minted:
@@ -74,7 +78,8 @@ class Api:
                 forms.holds_piece(code, s) for s in self.secrets
             )
             raise RotateError(
-                f"HTTP {answer.status} from {where}" + (f" ({code})" if plain else "")
+                f"HTTP {answer.status} from {where}" + (f" ({code})" if plain else ""),
+                answer.status,
             )
         try:
             doc: object = json.loads(answer.body or "{}")
@@ -174,6 +179,16 @@ class Cloudflare(Rotator):
     def revoke(self, api: Api, minter: Secret, key_id: str) -> None:
         api.call("DELETE", f"{CF}/{key_id}", "/client/v4/user/tokens/<id>", minter)
 
+    def expiry(self, answer: probes.Answer) -> datetime.date | None:
+        """The expiry Cloudflare reports in the verify answer, so the 180-day check reads what
+        the provider holds, not what keys asked for."""
+        try:
+            doc = cast(dict[str, Any], json.loads(answer.body))
+            text = cast(dict[str, Any], doc.get("result") or {}).get("expires_on")
+            return datetime.date.fromisoformat(str(text)[:10]) if text else None
+        except (ValueError, AttributeError):
+            return None
+
 
 # ---------------------------------------------------------------------------- Resend
 
@@ -219,12 +234,12 @@ class GitHubPat(Rotator):
         owner = c.owner or fields.get("owner", "")
         if not OWNER.fullmatch(owner) or looks.looks_like_value(owner):
             raise RotateError("github-pat needs owner: the user or org the token is for")
-        query = {
+        query = {  # the permissions first, so none of them can replace the fixed settings
+            **c.permissions,
             "name": name,
             "description": "Managed by keys",
             "target_name": owner,
             "expires_in": str(MAX_DAYS),
-            **c.permissions,
         }
         return f"{PAT_NEW}?{urllib.parse.urlencode(query)}"
 

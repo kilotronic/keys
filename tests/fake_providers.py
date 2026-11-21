@@ -17,7 +17,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from keys.probes import Answer
-from tests.canary import Canary
+from tests.canary import Canary, LeakError
 
 CF = "/client/v4/user/tokens"
 
@@ -52,6 +52,9 @@ class Providers:
         self.mint_status = "active"  # the status a newly minted key gets
         self.ignore_revoke = False  # a revoke that answers 200 but leaves the key working
         self.last_body: dict[str, Any] = {}
+        self.cf_expires_on = ""  # what Cloudflare reports, when it ignored the asked expiry
+        # (method, path, status): a failure that starts once any DELETE has been answered
+        self.fail_after_delete: tuple[str, str, int] | None = None
 
     # ------------------------------------------------------------------ setting the scene
 
@@ -76,6 +79,14 @@ class Providers:
         parts = urlsplit(url)
         assert parts.scheme == "https"
         self.calls.append((method, parts.path))
+        sent = url.encode() + (data or b"")
+        for value in self.canary.secrets():
+            found = self.canary._leak(value, sent)  # pyright: ignore[reportPrivateUsage]
+            if found:
+                raise LeakError(f"a watched value went to a provider in a URL or body ({found})")
+        if method == "DELETE" and self.fail_after_delete:
+            m, path, code = self.fail_after_delete
+            self.fails[(m, path)] = code
         status = self.fails.get((method, parts.path))
         if status is not None:
             body = {"errors": [{"code": "fake_failure", "message": self.canary.value}]}
@@ -106,7 +117,8 @@ class Providers:
         if path == f"{CF}/verify":
             if me is None:
                 return Answer(401, json.dumps({"success": False, "errors": [{"code": 1000}]}))
-            return Answer(200, json.dumps({"result": {"id": me.ident, "status": me.status}}))
+            result = {"id": me.ident, "status": me.status, "expires_on": me.expires or None}
+            return Answer(200, json.dumps({"result": result}))
         if me is None or not me.can_mint:
             return Answer(403, json.dumps({"success": False, "errors": [{"code": 9109}]}))
         if method == "POST" and path == CF:
@@ -115,7 +127,7 @@ class Providers:
                 "cf",
                 policies=body.get("policies", []),
                 condition=body.get("condition", {}),
-                expires=body.get("expires_on", ""),
+                expires=self.cf_expires_on or body.get("expires_on", ""),
                 name=body.get("name", ""),
             )
             result = {"id": key.ident, "value": value, "expires_on": key.expires}

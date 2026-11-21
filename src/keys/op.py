@@ -116,6 +116,8 @@ def set_fields(item: dict[str, Any], values: dict[str, str], concealed: set[str]
     for label, value in values.items():
         if label in by_label:
             by_label[label]["value"] = value
+            if label in concealed:  # a field made by hand as plain text holds a key concealed
+                by_label[label]["type"] = "CONCEALED"
         else:
             kind = "CONCEALED" if label in concealed else "STRING"
             row = {"id": label, "label": label, "type": kind, "value": value}

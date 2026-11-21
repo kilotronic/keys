@@ -315,8 +315,8 @@ Replaces a credential end to end, in the design's eight steps, and stops at the 
 5. **Sync** to every target, as `keys sync` does.
 6. **Verify.** A GitHub secret's update date moved; with `verify = { workflow = "deploy.yml" }`
    on its target, that workflow is dispatched once on `main` and watched once
-   (`gh run watch --interval 60 --exit-status`). Railway is redeployed and waited for. Key Vault
-   and Secret Manager carry the new fingerprint.
+   (`gh run watch --interval 60 --exit-status`; only a dispatch on `main` counts). Railway is
+   redeployed and waited for. Key Vault and Secret Manager carry the new fingerprint.
 7. **Revoke** the old key by API and probe it until it is refused. With no revoke API (GitHub
    tokens), keys opens the token page, exits 5, and on the next run probes the old token and
    carries on once it is dead.
@@ -338,17 +338,31 @@ deploy  github-actions-env owner/app env:production CLOUDFLARE_API_TOKEN  fp:775
 keys rotate: deploy rotated; commit the mapping file
 ```
 
-- **Where it stands** is the item's `keys_step` field (with `pending_id`, `previous_id` and
-  `keys_expires`, none of them secret), so a rerun resumes at the step that stopped: nothing is
-  minted twice and a finished sync is not repeated.
+- **Where it stands** is the item's `keys_step` field (with `pending_id`, `previous_id`,
+  `unrevoked_id` and `keys_expires`, none of them secret), so a rerun resumes at the step that
+  stopped: nothing is minted twice and a finished sync is not repeated. Each save reads the item
+  first and saves nothing if another run moved it on meanwhile.
+- **A rerun after an unclear answer.** If a probe of the new key gets no clear answer (no
+  connection, a 5xx), the key stays in `pending` and a rerun probes it again; only a key the
+  provider refuses is revoked. A rerun at step 7 probes the old key first, so an old key whose
+  revoke went through but was not recorded counts as gone (a 404 on its delete does too).
 - **Rollback.** Until step 7 the old key still works and sits in `previous`. A failure in steps 5
-  or 6 writes it back to every target already changed (and redeploys Railway), moves it back to
-  the main field, and revokes the new key. If the old key cannot be put back somewhere, 1Password
-  keeps the new key and a rerun finishes the rotation instead. A failure in step 7 keeps
-  `previous`: the new key is live everywhere, so nothing is broken. Nothing is rolled back after
-  step 7.
-- `--dry-run` reads no value: it lists the targets, checks the Environments and that the items
-  are in their vaults, and prints the plan. Nothing is changed.
+  or 6 writes it back to every target the sync reached, including the one that failed (a write
+  that timed out may have landed), redeploys Railway, moves it back to the main field, and
+  revokes the new key. If the old key cannot be put back somewhere, 1Password keeps the new key
+  and a rerun finishes the rotation instead. If the new key's revoke fails, its id stays in
+  `unrevoked_id` and the next run revokes it first. Workflows are dispatched last, after every
+  other target checks out; if a rollback follows one, keys names it so it can be run again. A
+  failure in step 7 keeps `previous`: the new key is live everywhere, so nothing is broken.
+  Step 7 first checks that the new key still works (an owner who deleted the wrong token on the
+  provider's page is told so). Nothing is rolled back after step 7.
+- **The first value.** An item with no key yet (just made by `keys new`) gets one minted or
+  pasted, with nothing to put back or revoke; keys refuses this when a target already holds the
+  secret, since a rollback could not restore it. An item with a key but no key id (for a kind
+  revoked by id) is refused before anything is made.
+- `--dry-run` reads no value from 1Password and changes nothing: it lists the targets, checks
+  the Environments and that the items are in their vaults, and prints the plan. Listing a
+  Railway target reads its variables (Railway lists names with values), in memory only.
 - `--now` is needed for a kind whose provider keeps one key at a time (none of today's kinds),
   since rotating it means a short outage.
 - Kinds: `cloudflare-token` (a user token; the new one copies the old one's policies and IP

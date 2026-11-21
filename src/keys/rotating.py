@@ -24,6 +24,7 @@ value, and never a program's or a provider's own text.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import json
 import re
@@ -44,6 +45,8 @@ STEP = "keys_step"  # where a rotation stands, kept in the item (not secret)
 EXPIRES = "keys_expires"  # the new key's expiry, from the provider, until it is recorded
 PENDING, PREVIOUS = "pending", "previous"
 PENDING_ID, PREVIOUS_ID = "pending_id", "previous_id"
+# A new key a rollback could not revoke: the next run revokes it before anything else.
+UNREVOKED_ID = "unrevoked_id"
 AWAITING, CREATED, STORED, VERIFIED, REVOKED = (
     "awaiting-paste",
     "pending",
@@ -60,6 +63,9 @@ RUN_LOOKS = 6  # looks for the run a dispatch started
 WATCH_TIMEOUT_S = 3600
 WORKFLOW = re.compile(r"[A-Za-z0-9_.-]{1,100}\.ya?ml")
 PLAIN_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+REVOKED_NEW = "the new key was revoked"
 
 
 class StepError(Exception):
@@ -155,6 +161,8 @@ class Rotation:
         self.fp_key = Secret("")
         self.minter_value = Secret("")
         self.item: dict[str, Any] = {}
+        self.deployed: set[tuple[str, ...]] = set()  # Railway scopes redeployed with the new key
+        self.ran: list[str] = []  # workflows dispatched with the new key
 
     # ------------------------------------------------------------------ helpers
 
@@ -165,18 +173,37 @@ class Rotation:
         return fingerprint(self.fp_key, value)
 
     def api(self, *values: Secret) -> rotators.Api:
-        return rotators.Api(self.send, [self.minter_value, *values])
+        """The provider client; an error code holding a piece of any key in play (the minting
+        key, these, and every concealed value of the item) is dropped, and an id pasted with
+        one of them is refused."""
+        f = self.fields() if self.item else {}
+        held = [Secret(f[k]) for k in (self.c.field, PENDING, PREVIOUS) if f.get(k)]
+        return rotators.Api(self.send, [self.minter_value, *values, *held])
 
     def fields(self) -> dict[str, str]:
         return fields(self.item)
 
     def save(self, step: int, values: dict[str, str], after: str = "") -> None:
-        """The item with these fields set, saved in one edit."""
-        set_fields(self.item, values, {self.c.field, PENDING, PREVIOUS})
+        """These fields set on the item as 1Password holds it now, in one edit. If another run
+        moved the item on since this one last saw it, nothing is saved."""
+        tail = f"; {after}" if after else ""
+        expected = self.fields().get(STEP, "")
         try:
-            self.op.item_edit(self.c.vault, self.item)
+            fresh = self.op.item_get(self.c.vault, self.c.item_title)
         except OpError as e:
-            raise StepError(step, f"{e}" + (f"; {after}" if after else "")) from None
+            raise StepError(step, f"{e}{tail}") from None
+        if fields(fresh).get(STEP, "") != expected:
+            raise StepError(
+                step,
+                "another keys rotate changed the item meanwhile, so this run saved nothing; "
+                "let that one finish",
+            )
+        set_fields(fresh, values, {self.c.field, PENDING, PREVIOUS})
+        try:
+            self.op.item_edit(self.c.vault, fresh)
+        except OpError as e:
+            raise StepError(step, f"{e}{tail}") from None
+        self.item = fresh
 
     def reload(self) -> None:
         try:
@@ -336,6 +363,11 @@ class Rotation:
                 "the item holds a pending or previous value keys did not leave there; clear "
                 "those fields in the 1Password app, then rerun",
             )
+        self.expires_field(1)  # a hand-edited value there stops the run before any save
+        if not step:
+            self.check_item(f)
+        if f.get(UNREVOKED_ID):
+            self.revoke_stray(f[UNREVOKED_ID])
         self.say(1, f"{len(self.ads)} targets reachable" + (", resuming" if step else ""))
         if step == "":
             if self.rot.mints:
@@ -360,6 +392,41 @@ class Rotation:
             self.record()
             return EXIT_OK
         raise StepError(1, "the item's keys_step field holds something keys did not write")
+
+    def check_item(self, f: dict[str, str]) -> None:
+        """Before a fresh rotation: an old key keys can revoke has its id; with no old key (the
+        first value), no target holds the secret yet, since there is nothing to put back."""
+        id_field = self.rot.id_field
+        if f.get(self.c.field, "").strip():
+            if self.rot.revokes_by_api and id_field and not f.get(id_field, "").strip():
+                raise StepError(
+                    1,
+                    f"the item's {id_field} field is empty: fill it with the current key's id "
+                    "(keys revokes the old key by it), then rerun",
+                )
+            return
+        there = [a.describe() for a in self.ads if a.name in self.before.get(a.scope(), {})]
+        if there:
+            raise StepError(
+                1,
+                f"the item holds no key, but {', '.join(there)} already holds one: paste the "
+                "current key into the item first, so a rollback can put it back",
+            )
+
+    def revoke_stray(self, key_id: str) -> None:
+        """A new key an earlier rollback could not revoke goes before anything else."""
+        try:
+            key_id = rotators.ident(self.fields(), UNREVOKED_ID, [self.minter_value])
+            self.rot.revoke(self.api(), self.minter_value, key_id)
+        except rotators.RotateError as e:
+            if e.status != 404:
+                raise StepError(
+                    1,
+                    f"a key an earlier run made is still live and could not be revoked ({e}); "
+                    "rerun, or delete it by hand and clear the item's unrevoked_id field",
+                ) from None
+        self.save(1, {UNREVOKED_ID: ""})
+        self.say(1, "revoked the key an earlier rollback left live")
 
     # ------------------------------------------------------------------ 2 create
 
@@ -423,7 +490,13 @@ class Rotation:
         value = targets.normalise(Secret(f.get(PENDING, "")), self.c.name)
         verdict, reason, answer = self.probe(value)
         problem = ""
-        expires = f.get(EXPIRES, "")
+        expires = self.expires_field(3)
+        if verdict == probes.UNKNOWN:
+            raise StepError(
+                3,
+                f"cannot tell whether the new key works ({reason}); it stays in the item's "
+                "pending field and nothing else changed: rerun",
+            )
         if verdict != probes.WORKS:
             problem = f"the new key does not work: {verdict} ({reason})"
         elif KINDS[self.c.kind].can_expire:
@@ -442,6 +515,18 @@ class Rotation:
             raise StepError(3, f"{problem}; {gone}; pending cleared, nothing else changed")
         self.say(3, f"the new key fp:{self.fp(value)} works ({reason})")
         return expires
+
+    def expires_field(self, step: int) -> str:
+        """The item's keys_expires field: empty or a date keys wrote."""
+        text = self.fields().get(EXPIRES, "")
+        if text:
+            try:
+                datetime.date.fromisoformat(text)
+            except ValueError:
+                raise StepError(
+                    step, "the item's keys_expires field holds something keys did not write"
+                ) from None
+        return text
 
     def store(self, expires: str) -> None:
         f = self.fields()
@@ -475,16 +560,18 @@ class Rotation:
         fp = self.fp(new)
         written: list[targets.Adapter] = []
         for a in self.ads:
+            # Counted before the write: one that failed may still have landed (a timeout), and
+            # writing the old key back to a target that never changed does no harm.
+            written.append(a)
             try:
                 a.write(new, fp)
-            except targets.PartialWrite as e:
-                written.append(a)
-                self.rollback(5, a, str(e), written)
             except targets.TargetError as e:
                 self.rollback(5, a, str(e), written)
-            written.append(a)
             self.say(5, f"{a.describe()} fp:{fp}")
-        for a in self.ads:
+        # A workflow runs with the new key and may deploy it, so it goes last: a failure
+        # elsewhere rolls back before anything was dispatched.
+        later = [a for a in self.ads if a.target.verify.get("workflow")]
+        for a in [a for a in self.ads if a not in later] + later:
             try:
                 self.verify(a, fp)
             except targets.TargetError as e:
@@ -496,6 +583,7 @@ class Rotation:
     def verify(self, a: targets.Adapter, fp: str) -> None:
         if isinstance(a, targets.Railway):
             a.redeploy(self.ctx.sleep)
+            self.deployed.add(a.scope())
             self.say(6, f"{a.describe()} deployed")
             return
         now = a.listing().get(a.name)
@@ -511,6 +599,7 @@ class Rotation:
             raise targets.TargetError("GitHub shows no update after the sync")
         wf = a.target.verify.get("workflow")
         if wf and isinstance(a, targets.GitHubRepo | targets.GitHubEnv):
+            self.ran.append(f"{a.f('repo')} {wf}")
             self.run_workflow(a.f("repo"), wf)
             self.say(6, f"{a.describe()} updated; {wf} passed")
         else:
@@ -518,7 +607,7 @@ class Rotation:
 
     def _runs(self, repo: str, wf: str) -> list[int]:
         argv = ["gh", "run", "list", "--repo", repo, "--workflow", wf, "--limit", "20"]
-        out = self.gh(6, "listing runs", [*argv, "--json", "databaseId,event"])
+        out = self.gh(6, "listing runs", [*argv, "--json", "databaseId,event,headBranch"])
         try:
             rows = cast(list[Any], json.loads(out or "[]"))
         except ValueError:
@@ -528,6 +617,7 @@ class Rotation:
             for r in rows
             if isinstance(r, dict)
             and cast(dict[str, Any], r).get("event") == "workflow_dispatch"
+            and cast(dict[str, Any], r).get("headBranch") == "main"
             and isinstance(cast(dict[str, Any], r).get("databaseId"), int)
         ]
 
@@ -563,18 +653,30 @@ class Rotation:
         c = self.c
         old = targets.normalise(Secret(f.get(PREVIOUS, "")), c.name)
         new = Secret(f.get(c.field, ""))
-        fp_old = self.fp(old)
+        fp_old = self.fp(old) if old else ""
         stuck: list[str] = []
-        for a in written:
-            try:
-                a.write(old, fp_old)
-            except targets.TargetError:
-                stuck.append(a.describe())
-        for a in {a.scope(): a for a in written if isinstance(a, targets.Railway)}.values():
-            try:
-                a.redeploy(self.ctx.sleep)
-            except targets.TargetError:
-                stuck.append(f"{a.describe()} (redeploy)")
+        notes: list[str] = []
+        if old:
+            for a in written:
+                try:
+                    a.write(old, fp_old)
+                except targets.TargetError:
+                    if a is not at or self.landed(a, self.fp(new)) is not False:
+                        stuck.append(a.describe())
+            for a in {a.scope(): a for a in written if isinstance(a, targets.Railway)}.values():
+                try:
+                    a.redeploy(self.ctx.sleep)
+                except targets.TargetError:
+                    if a.scope() in self.deployed:  # it runs the new key, about to be revoked
+                        stuck.append(f"{a.describe()} (redeploy)")
+                    else:  # the deployment from before the rotation still runs
+                        notes.append(f"redeploy {a.service_label()} by hand when you can")
+        else:
+            notes.append("there was no old key, so the targets keep the new one, now revoked")
+        if self.ran:
+            notes.append(
+                f"{', '.join(self.ran)} ran with the new key: run it again once this is fixed"
+            )
         head = f"failed at {at.describe()}: {why}"
         if stuck:
             raise StepError(
@@ -586,6 +688,8 @@ class Rotation:
         new_id = f.get(self.rot.id_field, "") if self.rot.id_field else ""
         if self.rot.id_field:
             values |= {self.rot.id_field: f.get(PREVIOUS_ID, ""), PREVIOUS_ID: ""}
+        if self.rot.revokes_by_api and new_id:
+            values[UNREVOKED_ID] = new_id  # kept until the revoke below goes through
         try:
             self.save(step, values)
         except StepError as e:
@@ -595,11 +699,35 @@ class Rotation:
                 f"put back ({str(e).split(': ', 1)[1]}): the old key is in its previous field",
             ) from None
         gone = self.revoke_new(new, new_id)
+        if UNREVOKED_ID in values and gone == REVOKED_NEW:
+            with contextlib.suppress(StepError):
+                self.save(step, {UNREVOKED_ID: ""})
+        where = f"the old key fp:{fp_old}" if old else "no key (as before)"
+        tail = "".join(f"; {n}" for n in notes)
         raise StepError(
             step,
-            f"{head}; rolled back: every target and 1Password hold the old key fp:{fp_old} "
-            f"again; {gone}",
+            f"{head}; rolled back: every target and 1Password hold {where} again; {gone}{tail}",
         )
+
+    def landed(self, a: targets.Adapter, fp_new: str) -> bool | None:
+        """Whether a write that failed reached the target after all: the secret's date moved,
+        its fingerprint tag names the new key, or (Railway) it holds the new key. None when
+        keys cannot tell."""
+        try:
+            if isinstance(a, targets.Railway):
+                value = a.read()
+                return value is not None and self.fp(Secret(value.reveal().rstrip("\n"))) == fp_new
+            now = a.listing().get(a.name)
+        except targets.TargetError:
+            return None
+        then = self.before.get(a.scope(), {}).get(a.name)
+        if isinstance(a, targets.AzureKeyVault | targets.GcpSecret):
+            return now is not None and now.fp == fp_new
+        if now is None:
+            return False
+        if then is None or not then.updated_at or not now.updated_at:
+            return None
+        return now.updated_at != then.updated_at
 
     # ------------------------------------------------------------------ revoking
 
@@ -609,8 +737,11 @@ class Rotation:
             try:
                 self.rot.revoke(self.api(value), self.minter_value, key_id)
             except rotators.RotateError as e:
-                return f"the new key could not be revoked ({e}): delete {self.key_name!r} by hand"
-            return "the new key was revoked"
+                return (
+                    f"the new key could not be revoked ({e}): the next keys rotate revokes it, "
+                    f"or delete {self.key_name!r} by hand"
+                )
+            return REVOKED_NEW
         if self.rot.revoke_page:
             self.open(self.rot.revoke_page, "the page to revoke the new key")
         return f"delete the new key {self.key_name!r} on the page just opened"
@@ -619,19 +750,43 @@ class Rotation:
         """Revoke the old key and see it refused. True when waiting for the owner's click."""
         f = self.fields()
         old = targets.normalise(Secret(f.get(PREVIOUS, "")), self.c.name)
+        new = targets.normalise(Secret(f.get(self.c.field, "")), self.c.name)
+        # The new key is what every target holds now; if it stopped working (the owner deleted
+        # the wrong one), the old one must not go too.
+        verdict, reason, _ = self.probe(new)
+        if verdict != probes.WORKS:
+            raise StepError(
+                7,
+                f"the new key no longer works ({verdict}, {reason}), and every target holds it; "
+                "the old key stays in 1Password's previous field: make a new key and rerun",
+            )
+        if not old:
+            self.save(7, {STEP: REVOKED}, "rerun to record it")
+            self.say(7, "there was no old key to revoke")
+            return False
         fp_old = self.fp(old)
         keep = (
             "the old key stays in 1Password's previous field; nothing is broken: rerun to try again"
         )
         if self.rot.revokes_by_api:
-            try:
-                key_id = rotators.ident(f, PREVIOUS_ID, [old, self.minter_value])
-                self.rot.revoke(self.api(old), self.minter_value, key_id)
-            except rotators.RotateError as e:
+            # A rerun after a revoke that went through, but was not recorded, finds it dead.
+            verdict, reason, _ = probes.check_answer(
+                probes.PROVIDERS[self.rot.probe], old, probes.Options(), self.send
+            )
+            if verdict != probes.DEAD:
+                try:
+                    key_id = rotators.ident(f, PREVIOUS_ID, [old, self.minter_value])
+                    self.rot.revoke(self.api(old), self.minter_value, key_id)
+                except rotators.RotateError as e:
+                    if e.status != 404:  # 404: already gone; the probe below says so
+                        raise StepError(
+                            7, f"the old key fp:{fp_old} was not revoked: {e}; {keep}"
+                        ) from None
+                verdict, reason, _ = self.probe_dead(old)
+            if verdict == probes.UNKNOWN:
                 raise StepError(
-                    7, f"the old key fp:{fp_old} was not revoked: {e}; {keep}"
-                ) from None
-            verdict, reason, _ = self.probe_dead(old)
+                    7, f"cannot tell whether the old key fp:{fp_old} is dead ({reason}); {keep}"
+                )
             if verdict != probes.DEAD:
                 raise StepError(
                     7, f"the old key fp:{fp_old} still works after the revoke ({reason}); {keep}"
@@ -673,7 +828,7 @@ class Rotation:
         f = self.fields()
         new = targets.normalise(Secret(f[c.field]), c.name)
         fp = self.fp(new)
-        expires = f.get(EXPIRES, "") if KINDS[c.kind].can_expire else ""
+        expires = self.expires_field(8) if KINDS[c.kind].can_expire else ""
         values: dict[str, str | None] = {
             "fp": json.dumps(fp),
             "rotated": self.today.isoformat(),

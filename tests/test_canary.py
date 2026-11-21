@@ -277,19 +277,35 @@ def test_an_inherited_environment_holding_the_value_is_caught(canary: Canary) ->
 
 
 def test_child_stdin_is_allowed_for_op_item_create_only(canary: Canary) -> None:
-    def create(ctx: Context) -> int:
-        subprocess.run(
-            ["op", "item", "create", "--vault", "V", "-"],
-            input=canary.value,
-            text=True,
-            check=False,
-            capture_output=True,
-        )
-        return 0
+    concealed = json.dumps(
+        {
+            "title": "t",
+            "fields": [{"label": "credential", "type": "CONCEALED", "value": canary.value}],
+        }
+    )
+    plain = concealed.replace("CONCEALED", "STRING")
 
-    result = canary.call(create)
+    def create(item: str) -> Callable[[Context], int]:
+        def run(ctx: Context) -> int:
+            subprocess.run(
+                ["op", "item", "create", "--vault", "V", "-"],
+                input=item,
+                text=True,
+                check=False,
+                capture_output=True,
+            )
+            return 0
+
+        return run
+
+    result = canary.call(create(concealed))
     assert result.children[0].argv == ["op", "item", "create", "--vault", "V", "-"]
-    assert result.children[0].stdin == canary.value
+    assert result.children[0].stdin == concealed
+    # In an item write a value may sit only in a concealed field.
+    with pytest.raises(LeakError, match="plain field 'credential'"):
+        canary.call(create(plain))
+    with pytest.raises(LeakError, match="op item write"):
+        canary.call(create(canary.value))
 
     def clipboard(ctx: Context) -> int:
         subprocess.run(["pbcopy"], input=canary.value, text=True, check=False, capture_output=True)
