@@ -38,7 +38,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: kilotronic/lint@50d58c6fc3916432a60d6caf5914d5bb83a60a16 # v1.1.0
+      - uses: kilotronic/lint@57c42f430af9a89607e32d1947714e2e594db6f3 # v1.2.0
 
   # Real authors on this event's commits, in the owner's domains, from kilotronic/git-identity.
   git-identity:
@@ -50,10 +50,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: kilotronic/git-identity@5a7b91c3194870cf535ba8c37a6c93b19b5a933b # v2.3.1
+      - uses: kilotronic/git-identity@b0d54e809d81cabf61d357cbe519a9b9263b17cb # v2.4.0
         with:
           domains: ixid.net, kilotronic.com
           allow-bots: dependabot
+          commit-subject: true
 
   # ruff, pyright (strict) and the tests, the canary tests among them. zsh is installed so the
   # canary's shell-history check runs through a real interactive shell, as on the owner's Mac.
@@ -79,10 +80,23 @@ jobs:
       - run: uv run pyright
       - run: uv run pytest
 
+  # The format and lint bundle from .pre-commit-config.yaml (formatters, ruff, markdownlint, yamllint, ...),
+  # the same hooks a commit runs. The identity, secret and private-term hooks run as their own jobs.
+  prek:
+    name: Format and lint (prek)
+    runs-on: ubuntu-latest
+    env:
+      SKIP: git-identity,commit-subject,session-trailer,secret-scan,secret-scan-push,data-leak-check,data-leak-check-commit-msg,data-leak-check-pre-push
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: pipx run prek==0.5.11 run --all-files --show-diff-on-failure
+
   ci:
     name: ci
     runs-on: ubuntu-latest
-    needs: [data-leak-check, secret-scan, lint, git-identity, test]
+    needs: [data-leak-check, secret-scan, lint, git-identity, test, prek]
     if: always()
     steps:
       - env:
