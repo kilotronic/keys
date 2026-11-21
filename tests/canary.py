@@ -48,7 +48,7 @@ from urllib.parse import quote, quote_plus
 
 import pytest
 
-from keys import cli
+from keys import cli, looks
 from tests import canary_hook
 
 # Made up. Holds + / = " \ ~ ? and a space so that every encoding below differs from the raw form,
@@ -409,8 +409,10 @@ class Canary:
         self._load_db()
         entry = {"value": value, "updated_at": "2026-01-01T00:00:00Z", "writes": 0, **meta}
         self.db.setdefault("targets", {})[key] = entry
-        if secret:  # a key's SID or other plain field is not watched
+        if secret:
             self.watch(value)
+        else:  # a key's SID or other plain field: never a value that looks like a key
+            assert not looks.looks_like_value(value), "secret=False is for plain fields only"
         self._save_db()
 
     def target(self, key: str) -> dict[str, Any] | None:

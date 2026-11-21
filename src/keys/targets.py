@@ -301,6 +301,8 @@ class Railway(Adapter):
         except (LookupError, TypeError):
             raise TargetError(f"{self.service_label()} has no readable deployment list") from None
 
+    requested = False  # a redeploy was accepted by Railway
+
     def redeploy(self, sleep: Callable[[float], None] = time.sleep) -> None:
         """Redeploy and wait for the new deployment to succeed, told from the old by its id."""
         previous, status = self._latest()
@@ -312,6 +314,7 @@ class Railway(Adapter):
         else:
             raise TargetError(f"{self.service_label()}: the last deployment never finished")
         self._run("redeploying", ["railway", "redeploy", *self._scope_flags(), "--yes"])
+        self.requested = True  # from here the new deployment may go live, even if it fails
         for _ in range(DEPLOY_ATTEMPTS):
             ident, status = self._latest()
             if ident != previous and status not in IN_PROGRESS:

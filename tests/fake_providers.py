@@ -53,7 +53,9 @@ class Providers:
         self.keys: dict[str, dict[str, Key]] = {
             p: {} for p in ("cloudflare", "resend", "github", "twilio", "railway", "github-app")
         }
-        self.railway_lists_ids = True  # projectTokens answers with each token's id
+        self.railway_list_fails: set[int] = set()  # which projectTokens calls fail (1 first)
+        self.railway_lists = 0
+        self.twilio_refuse_reads: set[str] = set()  # key SIDs refused a read of the account
         self.calls: list[tuple[str, str]] = []
         self.fails: dict[tuple[str, str], int] = {}
         self.minted: list[str] = []
@@ -221,6 +223,8 @@ class Providers:
             return Answer(401, json.dumps({"code": 20003, "status": 401}))
         parts = path.split("/")  # /2010-04-01/Accounts/<account>[.json|/Keys...]
         if method == "GET" and len(parts) == 4:
+            if me.ident in self.twilio_refuse_reads:
+                return Answer(401, json.dumps({"code": 20003, "status": 401}))
             return Answer(200, json.dumps({"sid": parts[3].removesuffix(".json")}))
         if not me.can_mint:
             return Answer(401, json.dumps({"code": 70004, "status": 401}))
@@ -258,10 +262,11 @@ class Providers:
         if query.startswith("query { projects"):
             return Answer(200, json.dumps({"data": {"projects": {"edges": []}}}))
         if "projectTokens(" in query:
+            self.railway_lists += 1
+            if self.railway_lists in self.railway_list_fails:
+                return Answer(503, "{}")
             edges = [
-                {"node": {"id": k.ident, "name": k.name} if self.railway_lists_ids else {}}
-                for k in keys.values()
-                if not k.can_mint
+                {"node": {"id": k.ident, "name": k.name}} for k in keys.values() if not k.can_mint
             ]
             return Answer(200, json.dumps({"data": {"projectTokens": {"edges": edges}}}))
         if "projectTokenCreate" in query:

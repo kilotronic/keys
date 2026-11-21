@@ -47,6 +47,7 @@ PENDING, PREVIOUS = "pending", "previous"
 PENDING_ID, PREVIOUS_ID = "pending_id", "previous_id"
 # A new key a rollback could not revoke: the next run revokes it before anything else.
 UNREVOKED_ID = "unrevoked_id"
+ASKED = "keys_asked"  # the day keys asked for a paste or a download
 AWAITING, CREATED, STORED, VERIFIED, REVOKED = (
     "awaiting-paste",
     "pending",
@@ -58,6 +59,7 @@ STEPS = dict(
     enumerate(["preflight", "create", "probe", "store", "sync", "verify", "revoke", "record"], 1)
 )
 DOWNLOAD_LIMIT = 64 * 1024  # an RSA key's PEM is a few kB
+MIN_PEM = 200  # shorter than any RSA key's PEM: a download still arriving
 PROBE_TRIES = 3  # a fresh key can take a few seconds to authenticate
 PROBE_WAIT_S = 5
 RUN_LOOKS = 6  # looks for the run a dispatch started
@@ -403,6 +405,8 @@ class Rotation:
                 return self.ask_paste()
         elif step == AWAITING:
             took = not f.get(PENDING, "").strip() and self.take_download()
+            if not took and self.fields().get(PENDING, "").strip():
+                self.leftover_downloads()
             if not took and not self.fields().get(PENDING, "").strip():
                 self.ctx.say(f"{c.name}: 2 create: still waiting for the paste")
                 return self.ask_paste()
@@ -480,12 +484,6 @@ class Rotation:
                 2, f"{str(e).split(': ', 1)[1]}; {gone}; nothing else changed"
             ) from None
         self.say(2, f"made {self.key_name!r} fp:{self.fp(new.value)}, saved as pending")
-        if self.rot.id_field and not new.ident:
-            self.say(
-                2,
-                f"note: the provider did not name its id; fill the item's {self.rot.id_field} "
-                "field by hand before the next rotation",
-            )
 
     def ask_paste(self) -> int:
         c = self.c
@@ -494,12 +492,16 @@ class Rotation:
         except rotators.RotateError as e:
             raise UsageError(f"{c.name}: {e}") from None
         if self.fields().get(STEP) != AWAITING:
-            self.save(2, {PENDING: "", PENDING_ID: "", STEP: AWAITING})
+            self.save(
+                2, {PENDING: "", PENDING_ID: "", STEP: AWAITING, ASKED: self.today.isoformat()}
+            )
         self.open(page, "the page that makes the new key")
-        self.open_item()
+        download = self.rot.download(self.fields()) is not None
+        if not download:  # a downloaded key is never pasted, so the item stays closed
+            self.open_item()
         repos = sorted({r for a in self.ads for r in _repos(a)})
         say = self.ctx.say
-        if self.rot.download(self.fields()) is not None:
+        if download:
             say(f"{c.name}: 2 create: waiting for you, in the browser:")
             say("  on the page just opened, generate a private key; the browser saves it to")
             say("  Downloads. Do not open the file: the next run moves it into the item's")
@@ -516,19 +518,32 @@ class Rotation:
         say(f"  then run: keys rotate {c.name}")
         return EXIT_WAITING
 
-    def take_download(self) -> bool:
-        """For a key the provider hands out only as a file (a GitHub App key): the one file of
-        its name in ~/Downloads moved into the item's pending field, then deleted, so no copy
-        stays on disk. Its content is never printed; neither is anything but a count."""
+    def downloads(self) -> list[Path]:
+        """The files in ~/Downloads named as the provider names this key's download, dated on or
+        after the day keys asked for it (an older one is an earlier key, maybe the live one).
+        Links are left alone: deleting one would leave the file it points at."""
         pattern = self.rot.download(self.fields())
         home = self.environ.get("HOME", "")
         if pattern is None or not home:
-            return False
-        folder = Path(home) / "Downloads"
+            return []
+        asked = self.fields().get(ASKED, "") or self.today.isoformat()
+        found: list[Path] = []
         try:
-            found = [p for p in folder.iterdir() if pattern.fullmatch(p.name) and p.is_file()]
+            for p in (Path(home) / "Downloads").iterdir():
+                dated = re.search(r"\.(\d{4}-\d{2}-\d{2})\.", p.name)
+                if not pattern.fullmatch(p.name) or not dated or dated.group(1) < asked:
+                    continue
+                if not p.is_symlink() and p.is_file():
+                    found.append(p)
         except OSError:
-            return False
+            return []
+        return found
+
+    def take_download(self) -> bool:
+        """For a key the provider hands out only as a file (a GitHub App key): the one new file
+        of its name in ~/Downloads moved into the item's pending field, then deleted, so no copy
+        stays on disk. Its content is never printed; neither is anything but a count."""
+        found = self.downloads()
         if not found:
             return False
         if len(found) > 1:
@@ -539,24 +554,45 @@ class Rotation:
             )
         path = found[0]
         try:
-            if path.stat().st_size > DOWNLOAD_LIMIT:
-                raise OSError
-            text = Secret(path.read_text(encoding="utf-8"))
+            with path.open("rb") as f:
+                data = f.read(DOWNLOAD_LIMIT + 1)
+            text = Secret(data.decode("utf-8"))
         except (OSError, ValueError):
-            raise StepError(2, "could not read the downloaded key; delete it, then rerun") from None
+            raise StepError(2, "could not read the downloaded key; rerun") from None
+        if len(data) > DOWNLOAD_LIMIT:
+            raise StepError(2, "the downloaded file is too large to be a key; delete it, rerun")
         if not appjwt.is_rsa_key(text):
+            if len(data) < MIN_PEM:  # a browser makes the file before the key arrives in it
+                raise StepError(2, "wait for the download to finish, then rerun")
             raise StepError(
                 2, "the downloaded file is not an RSA private key; delete it, then rerun"
             )
         self.save(2, {PENDING: text.reveal()}, "the downloaded key is still in Downloads")
+        self.say(2, f"took the downloaded key {self.rot.describe(text)} into the pending field")
         del text
+        self.remove_download(path)
+        return True
+
+    def remove_download(self, path: Path) -> None:
         try:
             path.unlink()
         except OSError:
-            self.say(2, "moved the downloaded key into pending; delete the file in Downloads")
-            return True
-        self.say(2, "moved the downloaded key into the item's pending field and deleted the file")
-        return True
+            self.say(2, "delete the downloaded key file in Downloads: keys could not")
+            return
+        self.say(2, "deleted the downloaded file")
+
+    def leftover_downloads(self) -> None:
+        """A run that saved the download but stopped before deleting it: the file holding
+        exactly the pending key goes now."""
+        pending = Secret(self.fields().get(PENDING, ""))
+        for path in self.downloads():
+            try:
+                with path.open("rb") as f:
+                    same = Secret(f.read(DOWNLOAD_LIMIT).decode("utf-8")) == pending
+            except (OSError, ValueError):
+                continue
+            if same:
+                self.remove_download(path)
 
     def clear_clipboard(self) -> None:
         try:
@@ -570,6 +606,14 @@ class Rotation:
         """Probe the pending key; its expiry (ISO date or empty) when it passes."""
         f = self.fields()
         value = targets.normalise(Secret(f.get(PENDING, "")), self.c.name)
+        current = Secret(f.get(self.c.field, "").rstrip("\n"))
+        if current and value == current:  # never revoked: it is the live key
+            self.save(3, {PENDING: "", PENDING_ID: "", EXPIRES: "", STEP: ""})
+            raise StepError(
+                3,
+                "the pending value is the current key, not a new one; pending cleared, nothing "
+                "else changed: make a new key and rerun",
+            )
         verdict, reason, answer = self.probe(value, f.get(PENDING_ID, ""))
         problem = ""
         expires = self.expires_field(3)
@@ -644,8 +688,8 @@ class Rotation:
         if not name:
             return targets.normalise(Secret(f.get(PREVIOUS if old else c.field, "")), c.name)
         if old and name == self.rot.id_field:
-            return Secret(f.get(PREVIOUS_ID, ""))
-        return Secret(f.get(name, ""))
+            return targets.normalise(Secret(f.get(PREVIOUS_ID, "")), c.name)
+        return targets.normalise(Secret(f.get(name, "")), c.name)
 
     def sync_and_verify(self) -> None:
         written: list[targets.Adapter] = []
@@ -681,6 +725,8 @@ class Rotation:
             try:
                 a.redeploy(self.ctx.sleep)
             except targets.TargetError as e:
+                if a.requested:  # accepted, so it may go live with the new key after all
+                    self.deployed.add(a.scope())
                 self.rollback(6, a, str(e), written)
             self.deployed.add(a.scope())
             self.say(6, f"{a.service_label()} deployed")
@@ -864,7 +910,8 @@ class Rotation:
         page = self.revoke_page()
         if page:
             self.open(page, "the page to revoke the new key")
-        return f"delete the new key {self.key_name!r} on the page just opened"
+        which = self.rot.describe(value) or repr(self.key_name)
+        return f"delete the new key {which} on the page just opened"
 
     def revoke_old(self) -> bool:
         """Revoke the old key and see it refused. True when waiting for the owner's click."""
@@ -889,18 +936,17 @@ class Rotation:
             "the old key stays in 1Password's previous field; nothing is broken: rerun to try again"
         )
         if self.rot.revokes_by_api:
-            # A rerun after a revoke that went through, but was not recorded, finds it dead.
-            verdict, reason, _ = self.probe_once(old, f.get(PREVIOUS_ID, ""))
-            if verdict != probes.DEAD:
-                try:
-                    key_id = rotators.ident(f, PREVIOUS_ID, [old, self.minter_value])
-                    self.rot.revoke(self.api(old), self.grant, f, key_id)
-                except rotators.RotateError as e:
-                    if e.status != 404:  # 404: already gone; the probe below says so
-                        raise StepError(
-                            7, f"the old key fp:{fp_old} was not revoked: {e}; {keep}"
-                        ) from None
-                verdict, reason, _ = self.probe_dead(old, f.get(PREVIOUS_ID, ""))
+            # Always sent, even if the old key already probes dead (a probe can be refused for
+            # other reasons); a rerun after a revoke that went through gets a 404, which counts.
+            try:
+                key_id = rotators.ident(f, PREVIOUS_ID, [old, self.minter_value])
+                self.rot.revoke(self.api(old), self.grant, f, key_id)
+            except rotators.RotateError as e:
+                if e.status != 404:
+                    raise StepError(
+                        7, f"the old key fp:{fp_old} was not revoked: {e}; {keep}"
+                    ) from None
+            verdict, reason, _ = self.probe_dead(old, f.get(PREVIOUS_ID, ""))
             if verdict == probes.UNKNOWN:
                 raise StepError(
                     7, f"cannot tell whether the old key fp:{fp_old} is dead ({reason}); {keep}"
@@ -913,10 +959,15 @@ class Rotation:
             verdict, reason, _ = self.probe_once(old, f.get(PREVIOUS_ID, ""))
             if verdict == probes.WORKS:
                 self.open(self.revoke_page(), "the page to revoke the old key")
+                which = self.rot.describe(old)
+                keep_new = self.rot.describe(new)
+                if which:  # a key with no name on the provider's page: by its fingerprint
+                    line = f"delete the old key {which} (keep {keep_new})"
+                else:
+                    line = f"delete the old key (the one not named {self.key_name!r})"
                 self.ctx.say(
-                    f"{self.c.name}: 7 revoke: waiting for you: delete the old key (the one not "
-                    f"named {self.key_name!r}) on the page just opened, then run: keys rotate "
-                    f"{self.c.name}"
+                    f"{self.c.name}: 7 revoke: waiting for you: {line} on the page just opened, "
+                    f"then run: keys rotate {self.c.name}"
                 )
                 return True
             if verdict != probes.DEAD:

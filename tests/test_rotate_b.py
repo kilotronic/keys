@@ -231,10 +231,11 @@ def test_a_railway_token_whose_id_is_not_listed_still_rotates(
     rw: tuple[Canary, Providers, str],
 ) -> None:
     c, p, _ = rw
-    p.railway_lists_ids = False
+    p.railway_list_fails = {2}  # the look-up just after the mint
     result = rotate(c, p, "ci-prod")
     assert result.code == 0, result.stderr  # type: ignore[attr-defined]
-    assert "fill the item's token_id field by hand" in result.stdout  # type: ignore[attr-defined]
+    # Found by its name, unique for the day, when it is revoked next time.
+    assert c.op_fields(VAULT, RW_ITEM)["token_id"] == "byname-ci-prod_2026-11-21"
 
 
 def test_a_workspace_token_is_pasted_then_the_old_one_deleted_by_hand(
@@ -331,7 +332,7 @@ def test_two_downloaded_app_keys_are_refused(app: tuple[Canary, Providers, str])
     c.watch(one)
     c.watch(two)
     a = _download(c, one)
-    b = _download(c, two, "the-app.2026-11-20.private-key.pem")
+    b = _download(c, two, "the-app.2026-11-21.private-key (1).pem")
     result = rotate(c, p, "settings-app")
     assert result.code == 1  # type: ignore[attr-defined]
     assert "2 downloaded keys" in result.stderr  # type: ignore[attr-defined]
@@ -345,7 +346,7 @@ def test_a_downloaded_file_that_is_not_a_key_is_refused(
 ) -> None:
     c, p, _ = app
     assert rotate(c, p, "settings-app").code == 5  # type: ignore[attr-defined]
-    path = _download(c, "not a key")
+    path = _download(c, "not a key " * 40)
     result = rotate(c, p, "settings-app")
     assert result.code == 1  # type: ignore[attr-defined]
     assert "not an RSA private key" in result.stderr  # type: ignore[attr-defined]
@@ -365,3 +366,136 @@ def test_an_app_key_that_github_does_not_hold_is_not_kept(
     assert "does not work" in result.stderr  # type: ignore[attr-defined]
     assert c.op_fields(VAULT, APP_ITEM)["credential"] == old
     assert c.target(APP_AT)["value"] == old  # type: ignore[index]
+
+
+# ---------------------------------------------------------------------------- review
+
+
+def test_an_old_download_of_the_current_key_is_not_taken(
+    app: tuple[Canary, Providers, str],
+) -> None:
+    c, p, old = app
+    stale = _download(c, old, "the-app.2025-01-01.private-key.pem")
+    first = rotate(c, p, "settings-app")
+    assert first.code == 5  # type: ignore[attr-defined]
+    again = rotate(c, p, "settings-app")
+    assert again.code == 5  # type: ignore[attr-defined]  # still waiting: that file is old
+    assert stale.exists()
+    assert c.op_fields(VAULT, APP_ITEM)["pending"] == ""
+
+
+def test_a_pasted_value_equal_to_the_current_key_is_refused(
+    rw: tuple[Canary, Providers, str],
+) -> None:
+    c, p, ws = rw
+    assert rotate(c, p, "railway-ws").code == 5  # type: ignore[attr-defined]
+    c.op_set_field(VAULT, RW_WS, "pending", ws)  # the current token, pasted again
+    result = rotate(c, p, "railway-ws")
+    assert result.code == 1  # type: ignore[attr-defined]
+    assert "is the current key" in result.stderr  # type: ignore[attr-defined]
+    assert ws in p.keys["railway"]  # never revoked
+    assert c.op_fields(VAULT, RW_WS)["pending"] == ""
+
+
+def test_app_keys_are_named_by_the_fingerprint_github_shows(
+    app: tuple[Canary, Providers, str],
+) -> None:
+    from keys import appjwt
+    from keys.secret import Secret
+
+    c, p, old = app
+    assert rotate(c, p, "settings-app").code == 5  # type: ignore[attr-defined]
+    new, _, _ = make_key(1024)
+    c.watch(new)
+    p.keys["github-app"][new] = Key("new")
+    _download(c, new)
+    again = rotate(c, p, "settings-app")
+    assert again.code == 5  # type: ignore[attr-defined]
+    assert appjwt.github_fingerprint(Secret(old)) in again.stdout  # type: ignore[attr-defined]
+    assert appjwt.github_fingerprint(Secret(new)) in again.stdout  # type: ignore[attr-defined]
+
+
+def test_a_leftover_download_is_deleted_on_the_rerun(app: tuple[Canary, Providers, str]) -> None:
+    c, p, _ = app
+    assert rotate(c, p, "settings-app").code == 5  # type: ignore[attr-defined]
+    new, _, _ = make_key(1024)
+    c.watch(new)
+    p.keys["github-app"][new] = Key("new")
+    left = _download(c, new)
+    c.op_set_field(VAULT, APP_ITEM, "pending", new)  # saved, then the run stopped
+    rotate(c, p, "settings-app")
+    assert not left.exists()
+
+
+def test_a_download_still_arriving_is_not_called_a_bad_key(
+    app: tuple[Canary, Providers, str],
+) -> None:
+    c, p, _ = app
+    assert rotate(c, p, "settings-app").code == 5  # type: ignore[attr-defined]
+    path = _download(c, "")
+    result = rotate(c, p, "settings-app")
+    assert result.code == 1  # type: ignore[attr-defined]
+    assert "wait for the download to finish" in result.stderr  # type: ignore[attr-defined]
+    assert "delete it" not in result.stderr  # type: ignore[attr-defined]
+    assert path.exists()
+
+
+def test_a_railway_token_with_no_listed_id_is_still_revoked_on_rollback(
+    rw: tuple[Canary, Providers, str],
+) -> None:
+    c, p, _ = rw
+    p.railway_list_fails = {2}
+    c.child_fails(["gh", "secret", "set"], code=7, skip=0)
+    result = rotate(c, p, "ci-prod")
+    assert result.code == 1  # type: ignore[attr-defined]
+    assert p.minted[0] not in p.keys["railway"]
+
+
+def test_the_old_twilio_key_is_deleted_even_if_it_probes_dead(
+    tw: tuple[Canary, Providers],
+) -> None:
+    c, p = tw
+    p.twilio_refuse_reads = {OLD_SID}  # an old key that cannot read the account
+    result = rotate(c, p, "app-sms")
+    assert result.code == 0, result.stderr  # type: ignore[attr-defined]
+    assert ("DELETE", f"/2010-04-01/Accounts/{ACCOUNT}/Keys/{OLD_SID}.json") in p.calls
+    assert CANARY not in p.keys["twilio"]
+
+
+def test_a_sid_that_cannot_be_put_back_keeps_the_new_key(tw: tuple[Canary, Providers]) -> None:
+    c, p = tw
+    c.child_fails(["railway", "redeploy"], code=9)
+    # writes: 4 forward; the rollback's first write (staging's SID) fails
+    c.child_fails(["railway", "variable", "set"], code=8, skip=4)
+    result = rotate(c, p, "app-sms")
+    assert result.code == 1  # type: ignore[attr-defined]
+    assert "could not be put back" in result.stderr  # type: ignore[attr-defined]
+    assert p.minted[0] in p.keys["twilio"]
+    fields = c.op_fields(VAULT, TW_ITEM)
+    assert fields["credential"] == p.minted[0]
+
+
+def test_keys_check_deep_compares_a_sid_target_with_its_field(
+    tw: tuple[Canary, Providers],
+) -> None:
+    c, _ = tw
+    c.op_value(f"op://{VAULT}/{TW_ITEM}/credential", CANARY)
+    c.op_value(f"op://{VAULT}/{TW_ITEM}/key_sid", OLD_SID)
+    result = c.run(["check", "--deep"], env=ENV)
+    assert "TWILIO_API_KEY_SID  present, value matches 1Password" in result.stdout
+
+
+def test_a_plain_target_value_must_not_look_like_a_key(canary: Canary) -> None:
+    with pytest.raises(AssertionError):
+        canary.target_put("gh:o/r:X", made_up("looks"), secret=False)
+
+
+def test_a_redeploy_railway_accepted_counts_as_live_when_the_rollback_cannot_redeploy(
+    tw: tuple[Canary, Providers],
+) -> None:
+    c, p = tw
+    c.set_db("deploy_status", "CRASHED")  # accepted, then ended badly; so does the rollback's
+    result = rotate(c, p, "app-sms")
+    assert result.code == 1  # type: ignore[attr-defined]
+    assert "could not be put back" in result.stderr  # type: ignore[attr-defined]
+    assert p.minted[0] in p.keys["twilio"]  # not revoked: a service may run it

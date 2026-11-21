@@ -21,7 +21,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, cast
 
-from keys import forms, looks, mapping, probes
+from keys import appjwt, forms, looks, mapping, probes
 from keys.secret import Secret
 
 MAX_DAYS = 180
@@ -157,6 +157,11 @@ class Rotator:
         """What the probe needs besides the key: the key's own id (`key_id`, the one being
         probed) or a field of the item. Checked: plain ids only."""
         return probes.Options()
+
+    def describe(self, value: Secret) -> str:
+        """How the provider's page names a key it lists without a name keys gave it (a GitHub
+        App key, by its public fingerprint); empty when keys's name for it shows."""
+        return ""
 
     def download(self, fields: dict[str, str]) -> re.Pattern[str] | None:
         """The name of the file the provider's page downloads the new key as, for a kind
@@ -296,7 +301,8 @@ TWILIO = "https://api.twilio.com/2010-04-01/Accounts"
 
 
 class Twilio(Rotator):
-    """A standard or restricted API key, minted and deleted with a Main key (the minted_by
+    """A standard API key (a restricted one would come back standard, with wider rights, so
+    keys does not rotate those), minted and deleted with a Main key (the minted_by
     credential: its own `key_sid` and secret), for the item's `account_sid`. The value is the
     key's secret; its SID is the item's `key_sid` field, delivered by targets that say
     `field = "key_sid"`."""
@@ -346,6 +352,7 @@ class Twilio(Rotator):
 
 RAILWAY = "https://backboard.railway.com/graphql/v2"
 RAILWAY_TOKENS = "https://railway.com/account/tokens"
+BY_NAME = "byname-"  # a token id keys stands in for by the token's name
 TOKENS_QUERY = "query($p: String!) { projectTokens(projectId: $p) { edges { node { id name } } } }"
 CREATE = "mutation($i: ProjectTokenCreateInput!) { projectTokenCreate(input: $i) }"
 DELETE = "mutation($id: String!) { projectTokenDelete(id: $id) }"
@@ -395,10 +402,21 @@ class RailwayProject(Rotator):
             found = self._named(api, minter, project, name)
         except RotateError:
             found = []
-        # Without its id the token can still be used; only its revoke waits for the owner.
-        return Minted(new, found[0] if len(found) == 1 and IDENT.fullmatch(found[0]) else "")
+        if len(found) == 1 and IDENT.fullmatch(found[0]):
+            return Minted(new, found[0])
+        # No id listed: the name keys gave it is unique (checked above), so it is found by
+        # that name when it is revoked.
+        return Minted(new, BY_NAME + name.replace(" ", "_"))
 
     def revoke(self, api: Api, minter: Grant, fields: dict[str, str], key_id: str) -> None:
+        if key_id.startswith(BY_NAME):
+            project = ident(fields, "project_id", api.secrets)
+            named = self._named(
+                api, minter, project, key_id.removeprefix(BY_NAME).replace("_", " ")
+            )
+            if len(named) != 1:
+                raise RotateError("Railway lists no single token by the name keys gave it")
+            key_id = named[0]
         if self._gql(api, minter, DELETE, {"id": key_id}).get("projectTokenDelete") is not True:
             raise RotateError("Railway did not confirm the delete")
 
@@ -442,6 +460,12 @@ class GitHubAppKey(Rotator):
         if not IDENT.fullmatch(issuer.replace(".", "-")):
             raise RotateError("github-app-key needs the item's client_id (or app_id) field")
         return probes.Options(client_id=issuer)
+
+    def describe(self, value: Secret) -> str:
+        try:
+            return appjwt.github_fingerprint(value)
+        except appjwt.KeyFormatError:
+            return ""
 
     def download(self, fields: dict[str, str]) -> re.Pattern[str] | None:
         slug = fields.get("slug", "")

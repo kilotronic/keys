@@ -186,3 +186,20 @@ def test_looks_like_an_rsa_key() -> None:
     assert appjwt.is_rsa_key(Secret(pkcs1))
     assert appjwt.is_rsa_key(Secret(pkcs8))
     assert not appjwt.is_rsa_key(Secret("plain text"))
+
+
+@pytest.mark.skipif(shutil.which("openssl") is None, reason="openssl is not installed")
+@pytest.mark.parametrize("argv", [["genrsa", "2048"], ["genpkey", "-algorithm", "RSA"]])
+def test_keys_openssl_makes_are_read_and_fingerprinted_as_github_shows(
+    argv: list[str], tmp_path: Path
+) -> None:
+    pem = subprocess.run(["openssl", *argv], capture_output=True, check=True, text=True).stdout
+    assert appjwt.is_rsa_key(Secret(pem))
+    (tmp_path / "k.pem").write_text(pem)
+    der = subprocess.run(
+        ["openssl", "pkey", "-in", str(tmp_path / "k.pem"), "-pubout", "-outform", "DER"],
+        capture_output=True,
+        check=True,
+    ).stdout
+    want = "SHA256:" + base64.b64encode(hashlib.sha256(der).digest()).decode()
+    assert appjwt.github_fingerprint(Secret(pem)) == want

@@ -62,6 +62,12 @@ def _items(body: bytes) -> list[tuple[int, bytes]]:
 
 def _private(pem: Secret) -> tuple[int, int]:
     """(n, d) from the PEM."""
+    n, _, d = _numbers(pem)
+    return n, d
+
+
+def _numbers(pem: Secret) -> tuple[int, int, int]:
+    """(n, e, d) from the PEM."""
     found = PEM.search(pem.reveal())
     if found is None:
         raise KeyFormatError
@@ -86,10 +92,36 @@ def _private(pem: Secret) -> tuple[int, int]:
     if len(items) < 4 or any(t != 0x02 for t, _ in items[:4]):
         raise KeyFormatError
     n = int.from_bytes(items[1][1], "big")
+    e = int.from_bytes(items[2][1], "big")
     d = int.from_bytes(items[3][1], "big")
     if n.bit_length() < 1000 or not 1 < d < n:
         raise KeyFormatError
-    return n, d
+    return n, e, d
+
+
+def _der(tag: int, body: bytes) -> bytes:
+    n = len(body)
+    size = (
+        bytes([n])
+        if n < 0x80
+        else bytes([0x80 | ((n.bit_length() + 7) // 8)])
+        + n.to_bytes((n.bit_length() + 7) // 8, "big")
+    )
+    return bytes([tag]) + size + body
+
+
+def _der_int(n: int) -> bytes:
+    return _der(0x02, n.to_bytes(n.bit_length() // 8 + 1, "big"))
+
+
+def github_fingerprint(pem: Secret) -> str:
+    """How GitHub's App page names a key: SHA256: and the base64 SHA-256 of its public key
+    (SubjectPublicKeyInfo DER). Public, so it may be printed, and it tells two keys apart."""
+    n, e, _ = _numbers(pem)
+    rsa_key = _der(0x30, _der_int(n) + _der_int(e))
+    algorithm = _der(0x30, _der(0x06, RSA_OID) + b"\x05\x00")
+    spki = _der(0x30, algorithm + _der(0x03, b"\x00" + rsa_key))
+    return "SHA256:" + base64.b64encode(hashlib.sha256(spki).digest()).decode()
 
 
 def is_rsa_key(pem: Secret) -> bool:

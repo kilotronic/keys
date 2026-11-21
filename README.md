@@ -389,23 +389,25 @@ keys rotate: deploy rotated; commit the mapping file
   the item's `permission`, sending-only unless it says `full_access`, and its `domain_id`;
   minted and deleted with a full-access key; Resend keys have no expiry, so the rotation date
   counts), `github-pat` (the paste flow), and:
-  - `twilio-key`: a standard or restricted key, minted and deleted with a Main key (its
+  - `twilio-key`: a standard key (not a restricted one: Twilio's key API makes standard keys only, so a restricted key would come back with wider rights), minted and deleted with a Main key (its
     `minted_by` item holds the Main key's `key_sid` and secret) for the item's `account_sid`.
     The new key's SID goes to every target with `field = "key_sid"`. No expiry; the rotation
     date counts.
   - `railway-project-token`: minted with the workspace token named by `minted_by`, for the
     item's `project_id` and `environment_id`, named `<name> <yyyy-mm-dd>` (refused if a token
     of that name is there already), found again by name for its id, and the old one deleted by
-    `token_id`. If Railway does not list the new token's id, the rotation still finishes and
-    says to fill `token_id` by hand. No expiry.
+    `token_id`. If Railway does not list the new token's id at once, keys records it by its name (unique for the day) and finds it by that name when it is revoked. No expiry.
   - `railway-workspace-token`: only the dashboard makes and deletes one, so keys opens
     `railway.com/account/tokens` for the paste, and again for the old token's delete.
   - `github-app-key`: GitHub makes an App key only as a browser download, on the App's page
     (`owner` is the org that owns the App; leave it out for one your own account owns; the
     item's `slug` names the App). keys opens that page; on the next run it takes the one file
     named `<slug>.<date>.private-key.pem` from `~/Downloads`, saves it in the item's `pending`
-    field and deletes the file, so the key is never opened, copied or pasted. Several such
-    files are refused (delete all but the newest). The probe signs a JWT with the key and
+    field and deletes the file, so the key is never opened, copied or pasted. Only a file dated on or after the day keys asked counts (an older
+    one is an earlier key, maybe the live one), several are refused, an empty one means the
+    download is still arriving, and a link is left alone. Since GitHub lists App keys only by
+    fingerprint, keys names each the same way (`SHA256:...`) when it asks the owner to delete
+    one. A pasted or downloaded value equal to the current key is refused, for every kind. The probe signs a JWT with the key and
     reads `GET /app`. GitHub allows 25 keys at once, so the new key works before the old one
     is deleted on the same page.
   - Railway variables are read back in memory after the sync and their fingerprint compared,
