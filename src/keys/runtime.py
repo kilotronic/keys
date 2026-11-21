@@ -71,7 +71,15 @@ def psql_target(url: Secret) -> tuple[str, str, Secret]:
     user = urllib.parse.unquote(userinfo.split(":", 1)[0]) if at else ""
     netloc = f"{userinfo.split(':', 1)[0]}@{host}" if at else host
     bare = urllib.parse.urlunsplit(u._replace(netloc=netloc))
-    return bare, user, Secret(urllib.parse.unquote(u.password or ""))
+    password = urllib.parse.unquote(u.password or "")
+    # A password with an unencoded / ? or # ends the netloc early; the rest would reach argv.
+    if (
+        not at
+        or urllib.parse.urlsplit(bare).password is not None
+        or (password and password in bare)
+    ):
+        raise RuntimeStop("the database URL is not in a form keys can split safely")
+    return bare, user, Secret(password)
 
 
 def stored_form(t: mapping.Target, value: Secret) -> Secret:
@@ -93,7 +101,15 @@ class Runtime:
         self.today = ctx.today()
         self.fp_key = Secret("")
         self.ads = {c.name: targets.adapters(c, environ) for c in creds}
+        self.names = " ".join(c.name for c in creds)  # as typed, before any reordering
+        self.touched: list[str] = []  # credentials whose staging began
+        self.kept = False  # an old value was written to a `previous` variable
+        self.phase = "stage"
+        self.stranded_at: tuple[targets.Railway, str] | None = None
+        self.db_new_unconnected = ""  # the password variable, when the new URL failed
         for c in creds:
+            if c.redeploy and not any(isinstance(a, targets.Railway) for a in self.ads[c.name]):
+                raise UsageError(f"{c.name}.redeploy: it has no Railway target to name them by")
             for i, a in enumerate(self.ads[c.name]):
                 if a.target.field:
                     raise UsageError(f"{c.name}.target[{i}].field: a {c.kind} has no item")
@@ -131,36 +147,55 @@ class Runtime:
             problems = r.preflight_targets()
             if problems:
                 raise RuntimeStop(f"{c.name}: {'; '.join(problems)}; nothing was changed")
+        for a in self.services():  # a misspelt service in `redeploy` is found now, not later
+            try:
+                a.latest()
+            except targets.TargetError as e:
+                raise RuntimeStop(
+                    f"{a.service_label()}: {e}: is the service named right?; nothing was changed"
+                ) from None
 
     # ------------------------------------------------------------------ the run
 
     def go(self) -> int:
         self.fp_key = read_fp_key(self.args.fp_key, self.ctx)
-        self.preflight()
         if self.args.end_overlap:
+            self.preflight()
             return self.end_overlap()
         keep = bool(self.args.keep_previous)
+        if keep and not any(a.target.previous for c in self.creds for a in self.railway(c)):
+            raise UsageError("no target of these keeps a previous value (previous = ...)")
+        self.preflight()
         if keep:
             self.check_overlap()
+            # The overlapping ones last: a failure before them leaves nothing kept, so a plain
+            # rerun is safe; a failure after them leaves the rest staged.
+            self.creds.sort(key=lambda c: any(a.target.previous for a in self.railway(c)))
         new: dict[str, Secret] = {}
-        staged: list[str] = []
         try:
             for c in self.creds:
                 value = make_value(
                     c.generate or ("hex24" if c.kind == "postgres-password" else "hex32")
                 )
                 new[c.name] = value
+                self.touched.append(c.name)  # before its first write: it may land and fail
                 if c.kind == "postgres-password":
                     self.alter(c, value)
                 self.stage(c, value, keep)
-                staged.append(c.name)
+            self.end_previous(keep)
+            self.phase = "redeploy"
             self.redeploy()
             for c in self.creds:
                 self.read_back(c, new[c.name])
+            self.phase = "github"
             for c in self.creds:
                 self.github(c, new[c.name])
         except (RuntimeStop, targets.TargetError) as e:
-            raise RuntimeStop(f"{e}; {self.hint(staged, keep)}") from None
+            raise RuntimeStop(f"{e}; {self.hint(keep)}") from None
+        except KeyboardInterrupt:
+            raise RuntimeStop(f"interrupted; {self.hint(keep)}") from None
+        except Exception as e:  # its text may hold a value; its type does not
+            raise RuntimeStop(f"stopped by a {type(e).__name__}; {self.hint(keep)}") from None
         for c in self.creds:
             self.record(c, new[c.name])
         if keep:
@@ -175,20 +210,37 @@ class Runtime:
         )
         return EXIT_OK
 
-    def hint(self, staged: list[str], keep: bool) -> str:
-        names = " ".join(c.name for c in self.creds)
-        if not staged:
+    def hint(self, keep: bool) -> str:
+        """What a stop left, from how far the run got."""
+        names = self.names
+        rerun = f"rerun keys rotate {names} now, which makes and stages fresh ones"
+        if self.stranded_at is not None:  # the database changed; Railway may not have
+            return self.stranded(*self.stranded_at)
+        if self.db_new_unconnected:
+            return (
+                "the database and POSTGRES_PASSWORD hold the new password, but the new URL did "
+                "not connect with it; nothing restarted: check in the dashboard that the URL "
+                f"is built from {self.db_new_unconnected}, then {rerun}"
+            ).replace("POSTGRES_PASSWORD", self.db_new_unconnected, 1)
+        if not self.touched:
             return "nothing was staged: fix the cause and rerun"
-        if keep:
+        if keep and self.kept:
+            if self.phase == "github":
+                return (
+                    "the services run the new values; the GitHub targets not yet set still hold "
+                    "the old value, which still verifies while the overlap runs: before it ends, "
+                    f"run keys rotate {names} --end-overlap, then keys rotate {names}, which sets "
+                    "fresh values everywhere"
+                )
+            waiting = [c.name for c in self.creds if c.name not in self.touched]
+            rest = f"; {', '.join(waiting)} not staged yet: rotate it after" if waiting else ""
             return (
                 "the new values may be staged and live, with the old ones kept; do not rerun "
-                "(it would refuse): redeploy by hand, then end the overlap in "
-                f"{OVERLAP_DAYS} days with keys rotate {names} --end-overlap"
+                "(it would refuse): redeploy by hand, then end the overlap "
+                f"{OVERLAP_DAYS} days after that redeploy succeeds, with keys rotate {names} "
+                f"--end-overlap{rest}"
             )
-        return (
-            f"new values for {', '.join(staged)} may be staged, and may be live: rerun keys "
-            f"rotate {names} now, which makes and stages fresh ones"
-        )
+        return f"{', '.join(self.touched)} may be staged, and may be live: {rerun}"
 
     # ------------------------------------------------------------------ overlap
 
@@ -250,12 +302,22 @@ class Runtime:
             if keep and a.target.previous:
                 current = a.read()
                 if current is not None:
+                    self.kept = True
                     self.sibling(a, a.target.previous).write(current, "")
                     self.say(f"{c.name}: {a.target.previous} staged (the old value)")
             shown = stored_form(a.target, value)
             a.write(shown, "")
             self.say(f"{c.name}: {a.describe()} staged fp:{self.fp(shown)}")
-            if not keep and a.target.previous:
+
+    def end_previous(self, keep: bool) -> None:
+        """Without keep, a `previous` left from an overlap is deleted, once every value is
+        staged: a delete can deploy, and must not ship half the new values."""
+        if keep:
+            return
+        for c in self.creds:
+            for a in self.railway(c):
+                if not a.target.previous:
+                    continue
                 old = self.sibling(a, a.target.previous)
                 if old.read() is not None:
                     old.delete()
@@ -272,8 +334,8 @@ class Runtime:
         for c in self.creds:
             base = next(iter(self.railway(c)), None)
             for service in c.redeploy:
-                if base is None:
-                    raise UsageError(f"{c.name}.redeploy: it has no Railway target to name them by")
+                if base is None:  # refused when the run began
+                    continue
                 fields = {**base.target.fields, "service": service}
                 a = targets.Railway(mapping.Target("railway", fields, {}), self.environ, base.where)
                 if a.scope() not in {o.scope() for o in order}:
@@ -321,24 +383,21 @@ class Runtime:
         bare, user, password = psql_target(old_url)
         if not PG_USER.fullmatch(user):
             raise RuntimeStop(f"{c.name}: the database URL's user is not a plain name")
-        try:
-            self.psql(
-                bare, password, ALTER_SQL.format(user=user), {"verifier": scram_verifier(value)}
-            )
-            self.say(f"{c.name}: the database holds the new password")
-        except RuntimeStop as e:
-            raise RuntimeStop(f"{e}; {self.stranded(pg)}") from None
-        try:
-            pg.write(value, "")
-        except targets.TargetError as e:
-            raise RuntimeStop(f"{e}; {self.stranded(pg)}") from None
+        verifier = scram_verifier(value)
+        self.stranded_at = (pg, user)  # from here the ALTER may commit, whatever psql says
+        self.psql(bare, password, ALTER_SQL.format(user=user), {"verifier": verifier})
+        self.say(f"{c.name}: the database holds the new password")
+        pg.write(value, "")
+        self.stranded_at = None
+        self.db_new_unconnected = pg.name
         self.say(f"{c.name}: {pg.describe()} staged fp:{self.fp(value)}")
         new_url = url_at.read()
         if new_url is None:
-            raise RuntimeStop(f"{c.name}: {url_at.describe()} is gone; {self.stranded(pg)}")
+            raise RuntimeStop(f"{c.name}: {url_at.describe()} is gone")
         bare, _, password = psql_target(new_url)
         if self.psql(bare, password, "select 1;\n").strip() != "1":
             raise RuntimeStop(f"{c.name}: the database did not accept the new password")
+        self.db_new_unconnected = ""
         self.say(f"{c.name}: the new password connects")
 
     def psql(
@@ -353,21 +412,25 @@ class Runtime:
         env = proc.child_env(self.environ, names={"PGSSLMODE", "PGSSLROOTCERT"})
         env["PGPASSWORD"] = password.reveal()
         try:
-            done = proc.run(["psql", url, "-v", "ON_ERROR_STOP=1", "-qtA"], env, stdin=sets + sql)
+            # -X: no ~/.psqlrc, which could echo the ALTER or change the output.
+            argv = ["psql", url, "-X", "-v", "ON_ERROR_STOP=1", "-qtA"]
+            done = proc.run(argv, env, stdin=sets + sql)
         except proc.ChildError as e:
             raise RuntimeStop(str(e)) from None
         if done.code != 0:
             raise RuntimeStop(f"psql exited {done.code}")
         return done.stdout
 
-    def stranded(self, pg: targets.Railway) -> str:
-        service, environment = pg.f("service"), pg.f("environment")
+    def stranded(self, pg: targets.Railway, user: str) -> str:
+        """How to put the database back on what Railway holds, from inside its container."""
+        service, environment, project = pg.f("service"), pg.f("environment"), pg.f("project")
         return (
             "the database may now hold a password Railway does not; set it to what Railway "
             "holds, from inside the container, where local sign-ins need none: copy "
-            f"POSTGRES_PASSWORD from the {service} service's variables in the dashboard, run "
-            f"railway ssh --service {service} --environment {environment}, then "
-            "psql -U postgres -c '\\password postgres' and paste it at the prompt there"
+            f"{pg.name} from the {service} service's variables in the dashboard, add your SSH "
+            "key once with railway ssh keys add if Railway asks, run "
+            f"railway ssh --project {project} --service {service} --environment {environment}, "
+            f"then psql -U {user} -c '\\password {user}' and paste it at the prompt there"
         )
 
     def record(self, c: mapping.Credential, value: Secret) -> None:

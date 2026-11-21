@@ -450,14 +450,25 @@ previous = "JWT_SECRET_FALLBACK"
   `previous` variable before the new one, so tokens the old value signed keep working; it
   refuses while an overlap runs. After 30 days, `keys rotate <name> --end-overlap` deletes the
   `previous` variable and redeploys (either way, so a rerun finishes a redeploy that failed).
-  A plain rotation deletes any `previous` value, ending the overlap at once.
+  A plain rotation deletes any `previous` value, ending the overlap at once, but only once
+  every new value is staged (a delete can deploy). With `--keep-previous`, the credentials
+  that keep an old value are staged last, and the flag is refused when none does.
+- Each service in `redeploy` is looked up before anything changes, so a misspelt one changes
+  nothing. A `postgres-password` must list `redeploy` (the app must restart after Redis, say)
+  and cannot keep a `previous` value (a database has one password).
 - `postgres-password` first changes the database's password over the old URL (the variable
   `url_variable` names), sending a SCRAM verifier so the server never sees the password, then
   stages it, and the new URL must connect before anything restarts. psql gets the password in
-  `PGPASSWORD` and its `\set` lines on stdin, never on its command line. If anything fails
-  from the change on, keys says how to set the database back to what Railway holds.
-- A failure names what may be staged: rerun (fresh values) after a plain rotation; after
-  `--keep-previous`, redeploy by hand and end the overlap later.
+  `PGPASSWORD` and its `\set` lines on stdin, never on its command line, and runs with `-X`
+  (no `~/.psqlrc`). If anything fails, or the run is interrupted, between the change and
+  Railway holding the new password, keys says how to set the database back to what Railway
+  holds (the project, service, variable and database user, from inside the container). A URL
+  keys cannot split without leaving part of the password on psql's command line is refused.
+- A failure or an interruption names what may be staged, counting a write that failed but may
+  have landed: rerun (fresh values) after a plain rotation, or after `--keep-previous` when no
+  old value was kept yet; once one was, redeploy by hand and end the overlap 30 days after
+  that redeploy succeeds; if only GitHub targets were left, they still hold the old value,
+  which verifies until the overlap ends.
 - `keys sync`, `keys fp` and the 1Password pass of `keys scan` skip these (there is no item);
   `keys check --deep` compares Railway with the mapping file's `fp`, and a digest target only
   for being there.

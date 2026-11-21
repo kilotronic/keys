@@ -271,7 +271,7 @@ def target_key(prog: str, flags: dict[str, str | bool], name: str) -> str:
     return f"gcp:{_flag(flags, '--project')}:{name}"
 
 
-def _scram_check(password: str, verifier: str) -> bool:
+def scram_check(password: str, verifier: str) -> bool:
     """Whether password is the one behind a SCRAM-SHA-256 verifier, as Postgres checks it."""
     import base64
     import hashlib
@@ -290,11 +290,14 @@ def _scram_check(password: str, verifier: str) -> bool:
         return False
 
 
-def _psql(words: list[str], stdin: str, db: dict[str, Any]) -> int:
+def _psql(words: list[str], flags: dict[str, str | bool], stdin: str, db: dict[str, Any]) -> int:
     """A Postgres that knows one password (`pg_password`, or after an ALTER its verifier). The
     URL must hold no password: it comes in PGPASSWORD. `\\set name 'value'` lines are read."""
     from urllib.parse import urlsplit
 
+    if "-X" not in flags:
+        print("fake psql: reads ~/.psqlrc without -X", file=sys.stderr)
+        return 2
     url = urlsplit(words[0]) if words else None
     if url is None or url.password is not None:
         print("fake psql: a password on the command line", file=sys.stderr)
@@ -302,7 +305,7 @@ def _psql(words: list[str], stdin: str, db: dict[str, Any]) -> int:
     given = os.environ.get("PGPASSWORD", "")
     pg = db.setdefault("pg", {})
     known = pg.get("verifier")
-    ok = _scram_check(given, known) if known else given == pg.get("password")
+    ok = scram_check(given, known) if known else given == pg.get("password")
     if not ok:
         print("psql: FATAL: password authentication failed", file=sys.stderr)
         return 2
@@ -316,6 +319,9 @@ def _psql(words: list[str], stdin: str, db: dict[str, Any]) -> int:
                 return 3
             pg["verifier"] = sets["verifier"]
             pg["altered_by"] = url.username or ""
+            if pg.get("alter_fails_after"):  # committed, then the connection dropped
+                _save(db)
+                return 3
         elif line.strip() == "select 1;":
             print("1")
     _save(db)
@@ -405,13 +411,16 @@ def targets(
         db.get("targets", {}).pop(target_key("railway", flags, w[3]), None)
         return 0
     if prog == "psql":
-        return _psql(words, stdin, db)
+        return _psql(words, flags, stdin, db)
     if w[:3] == ["railway", "variable", "list"] and "--json" in flags:
         prefix = target_key("railway", flags, "")
         print(json.dumps({n: v["value"] for n, v in _under(db, prefix).items()}))
         return 0
     if w[:3] == ["railway", "deployment", "list"]:
         key = "deploys:" + target_key("railway", flags, "")
+        if key not in db.get("deploys", {}) and not _under(db, target_key("railway", flags, "")):
+            print("Service not found", file=sys.stderr)  # a service with no variables
+            return 1
         first = [{"id": "d0", "status": "SUCCESS"}]
         history = db.setdefault("deploys", {}).setdefault(key, first)
         for d in history:  # a deployment in flight finishes after its number of looks

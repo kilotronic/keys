@@ -388,7 +388,7 @@ def test_a_failed_alter_stages_nothing_and_prints_the_recovery(
     c.set_db("pg", {"password": CANARY, "alter_fails": True})
     result = rotate(c, "pg", "redis")
     assert result.code == 1
-    assert "railway ssh --service Postgres --environment production" in result.stderr
+    assert "railway ssh --project proj --service Postgres --environment production" in result.stderr
     assert value(c, PG + "POSTGRES_PASSWORD") == CANARY
     assert not redeploys(c)
 
@@ -472,3 +472,191 @@ def test_keys_new_refuses_a_secret_kept_only_at_its_targets(canary: Canary) -> N
     assert result.code == 3
     assert "no 1Password item" in result.stderr
     assert not canary.children()
+
+
+# ---------------------------------------------------------------------------- after review
+
+
+def test_a_plain_rotation_ends_the_overlap_only_after_every_value_is_staged(
+    signing: tuple[Canary, list[str], str],
+) -> None:
+    # A delete can deploy, so deleting the fallback between the two sets could ship the new
+    # JWT with the old SECRET_KEY.
+    c, _, _ = signing
+    c.target_put(APP + "JWT_SECRET_FALLBACK", CANARY)
+    result = rotate(c, "jwt-secret", "secret-key")
+    assert result.code == 0, result.stderr
+    steps = [ch.argv[2:4] for ch in c.children() if ch.argv[:2] == ["railway", "variable"]]
+    writes = [s for s in steps if s[0] in ("set", "delete")]
+    assert writes == [
+        ["set", "JWT_SECRET"],
+        ["set", "SECRET_KEY"],
+        ["delete", "JWT_SECRET_FALLBACK"],
+    ]
+
+
+def test_keep_previous_stages_the_overlapping_key_last(
+    signing: tuple[Canary, list[str], str],
+) -> None:
+    c, _, old_sk = signing
+    c.child_fails(["railway", "variable", "set", "SECRET_KEY"], code=7)
+    result = rotate(c, "jwt-secret", "secret-key", "--keep-previous")
+    assert result.code == 1
+    # Nothing kept yet, so a plain rerun is safe, and it says so.
+    assert "rerun keys rotate jwt-secret secret-key now" in result.stderr
+    assert value(c, APP + "JWT_SECRET") == CANARY
+    assert value(c, APP + "JWT_SECRET_FALLBACK") is None
+    assert value(c, APP + "SECRET_KEY") == old_sk
+
+
+def test_keep_previous_with_nothing_to_keep_is_refused(
+    erasure: tuple[Canary, list[str]],
+) -> None:
+    c, made = erasure
+    result = rotate(c, "erasure-key", "--keep-previous")
+    assert result.code == 3
+    assert "keeps a previous value" in result.stderr
+    assert made == []
+
+
+def test_a_postgres_password_cannot_keep_a_previous_value(canary: Canary) -> None:
+    (canary.work / "keys.toml").write_text(
+        DATASTORES.replace(
+            'variable = "POSTGRES_PASSWORD"', 'variable = "POSTGRES_PASSWORD"\nprevious = "OLD_PW"'
+        )
+    )
+    result = canary.run(["list"])
+    assert "a database has one password" in result.stderr
+
+
+def test_a_postgres_password_needs_its_restart_order(canary: Canary) -> None:
+    text = DATASTORES.replace(
+        'redeploy = ["Redis", "app", "Postgres"]\nkept_because = "the app signs in to its database',
+        'kept_because = "the app signs in to its database',
+        1,
+    )
+    (canary.work / "keys.toml").write_text(text)
+    result = canary.run(["list"])
+    assert "redeploy: missing" in result.stderr
+
+
+def test_a_misspelt_service_to_redeploy_changes_nothing(
+    stores: tuple[Canary, list[str]],
+) -> None:
+    c, made = stores
+    (c.work / "keys.toml").write_text(DATASTORES.replace('"app"', '"aap"'))
+    result = rotate(c, "pg", "redis")
+    assert result.code == 1
+    assert "aap" in result.stderr
+    assert made == []
+    assert "verifier" not in c.db["pg"]
+
+
+def test_redeploy_without_a_railway_target_is_refused_before_anything(
+    erasure: tuple[Canary, list[str]],
+) -> None:
+    c, made = erasure
+    text = ERASURE.replace('generate = "urlsafe32"', 'generate = "urlsafe32"\nredeploy = ["app"]')
+    text = (
+        text[: text.index('[[credential.target]]\ntype = "railway"')]
+        + text[text.index('[[credential.target]]\ntype = "github-actions-env"') :]
+    )
+    (c.work / "keys.toml").write_text(text)
+    result = rotate(c, "erasure-key")
+    assert result.code == 3
+    assert "no Railway target" in result.stderr
+    assert made == []
+
+
+def test_the_recovery_names_the_project_the_variable_and_the_url_user(
+    stores: tuple[Canary, list[str]],
+) -> None:
+    c, _ = stores
+    url = "postgresql://appuser:" + quote(CANARY, safe="") + "@db.example.test:5432/railway"
+    c.set_db("targets", {**c.db["targets"], PG + "DATABASE_PUBLIC_URL": {"value": url}})
+    c.set_db("pg", {"password": CANARY, "alter_fails": True})
+    result = rotate(c, "pg", "redis")
+    assert result.code == 1
+    assert "--project proj" in result.stderr
+    assert "\\password appuser" in result.stderr
+    assert "-U appuser" in result.stderr
+    assert "copy POSTGRES_PASSWORD" in result.stderr
+    assert "nothing was staged" not in result.stderr
+
+
+def test_an_alter_that_commits_and_then_fails_prints_the_recovery(
+    stores: tuple[Canary, list[str]],
+) -> None:
+    c, _ = stores
+    c.set_db("pg", {"password": CANARY, "alter_fails_after": True})
+    result = rotate(c, "pg", "redis")
+    assert result.code == 1
+    assert "verifier" in c.db["pg"]  # the database did change
+    assert "may now hold a password Railway does not" in result.stderr
+    assert value(c, PG + "POSTGRES_PASSWORD") == CANARY
+
+
+def test_a_new_url_that_does_not_connect_says_the_database_changed(
+    stores: tuple[Canary, list[str]],
+) -> None:
+    c, _ = stores
+    c.set_db("derived", {})
+    result = rotate(c, "pg")
+    assert result.code == 1
+    assert "nothing was staged" not in result.stderr
+    assert "the database and POSTGRES_PASSWORD hold the new password" in result.stderr
+
+
+def test_a_stage_that_landed_but_failed_is_not_called_nothing(
+    signing: tuple[Canary, list[str], str],
+) -> None:
+    c, made, _ = signing
+    c.child_fails(["railway", "variable", "set", "JWT_SECRET"], code=7, after=True)
+    result = rotate(c, "jwt-secret", "secret-key")
+    assert result.code == 1
+    assert value(c, APP + "JWT_SECRET") == made[0]
+    assert "nothing was staged" not in result.stderr
+    assert "jwt-secret may be staged" in result.stderr
+
+
+def test_a_stop_part_way_still_prints_the_recovery(
+    stores: tuple[Canary, list[str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    c, _ = stores
+
+    def stop(*args: object, **kwargs: object) -> str:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(runtime.Runtime, "psql", stop)
+    result = rotate(c, "pg", "redis")
+    assert result.code == 1
+    assert "interrupted" in result.stderr
+    assert "may now hold a password Railway does not" in result.stderr
+
+
+def test_keep_previous_then_a_github_failure_says_what_still_works(
+    erasure: tuple[Canary, list[str]],
+) -> None:
+    c, _ = erasure
+    text = ERASURE.replace(
+        'store = "sha256"', 'store = "sha256"\nprevious = "ERASURE_KEY_PREVIOUS"'
+    )
+    (c.work / "keys.toml").write_text(text)
+    c.writable.append(hashlib.sha256(CANARY.encode()).hexdigest())  # the old digest, kept
+    c.child_fails(["gh", "secret", "set"], code=7)
+    result = rotate(c, "erasure-key", "--keep-previous")
+    assert result.code == 1
+    assert "still hold the old value, which still verifies" in result.stderr
+    assert "redeploy by hand" not in result.stderr
+
+
+def test_psql_runs_without_reading_a_startup_file(stores: tuple[Canary, list[str]]) -> None:
+    c, _ = stores
+    result = rotate(c, "pg", "redis")
+    assert result.code == 0, result.stderr
+    assert all("-X" in ch.argv for ch in c.children() if ch.prog == "psql")
+
+
+def test_a_url_keys_cannot_split_safely_is_refused() -> None:
+    with pytest.raises(runtime.RuntimeStop):
+        runtime.psql_target(Secret("postgresql://u:a/b@h/db"))

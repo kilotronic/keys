@@ -350,6 +350,11 @@ def _credential(
             problems.append(f"{where}.{key}: only for generated and postgres-password")
     if kind == "postgres-password" and not url_variable:
         problems.append(f"{where}.url_variable: missing (the variable holding the database URL)")
+    if kind == "postgres-password" and not redeploy:
+        problems.append(
+            f"{where}.redeploy: missing (the services to restart, in order, once the database "
+            "knows the new password)"
+        )
 
     targets: list[Target] = []
     raw_targets: object = c.get("target", [])
@@ -362,6 +367,11 @@ def _credential(
             if t and t.field and known and t.field not in KINDS[cast(str, kind)].fields:
                 names = ", ".join(KINDS[cast(str, kind)].fields) or "none"
                 problems.append(f"{where}.target[{j}].field: a {kind} item's fields are {names}")
+            if t and t.previous and kind == "postgres-password":
+                problems.append(
+                    f"{where}.target[{j}].previous: a database has one password, so there is "
+                    "no old one to keep"
+                )
             if t:
                 targets.append(t)
 

@@ -643,6 +643,17 @@ class Canary:
                     held += [str(f.get("value") or "") for f in sent["fields"]]
         return [v for v in held if v]
 
+    def _env_ok(self, prog: str, name: str, value: str) -> bool:
+        """psql's PGPASSWORD may hold the database's own password, old or new, and nothing else
+        (not the fingerprint key, nor another credential's value)."""
+        if (prog, name) not in ENV_OK:
+            return False
+        from tests.fake_child import scram_check
+
+        pg = self.db.get("pg", {})
+        verifier = pg.get("verifier")
+        return value == pg.get("password") or bool(verifier and scram_check(value, verifier))
+
     def _expected_write(self, data: str, held: list[str]) -> bool:
         """A target write carries exactly one value 1Password held (the canary, an op_value or
         an item field), as read or with its trailing line breaks removed (keys's one change)."""
@@ -679,7 +690,7 @@ class Canary:
                 prog = self._program(e)
                 channels.append((f"argv of {prog}", "\0".join(e["argv"]).encode()))
                 env_text = "\0".join(
-                    f"{k}={v}" for k, v in e["env"].items() if (prog, k) not in ENV_OK
+                    f"{k}={v}" for k, v in e["env"].items() if not self._env_ok(prog, k, v)
                 )
                 channels.append((f"environment of {prog}", env_text.encode()))
             elif e["event"] == "write":
