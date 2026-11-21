@@ -1,0 +1,46 @@
+[project]
+name = "keys"
+version = "0.1.0"
+description = "Credentials kept out of transcripts: list, check, scan and create keys without ever printing a value."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.13"
+dependencies = []
+
+[project.scripts]
+keys = "keys.cli:entry"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.14", "pyright>=1.1.400"]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/keys"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "S", "PT"]
+ignore = [
+  "S603", # subprocess with a fixed program and argv list, never a shell: the point of the design
+  "S607", # op is found on PATH, as the owner's own shell finds it
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S108"]
+
+[tool.pyright]
+include = ["src", "tests"]
+typeCheckingMode = "strict"
+pythonVersion = "3.13"
+venvPath = "."
+venv = ".venv"

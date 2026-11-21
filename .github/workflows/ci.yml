@@ -1,0 +1,92 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Refuse the organisation's private terms (the DATA_LEAK_DENYLIST secret) in this event's commits:
+  # added lines, file paths, commit messages and authors.
+  data-leak-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: kilotronic/data-leak-check@f1da8a7ce76bfaabd70ea815d9417fb691e95799 # v1.1.0
+        with:
+          denylist: ${{ secrets.DATA_LEAK_DENYLIST }}
+
+  # Secrets in this event's commits: gitleaks (anything shaped like a secret) and trufflehog (keys that still
+  # work), from kilotronic/secret-scan.
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: kilotronic/secret-scan@2665d6f2f0260d3ae0defbedcce27fc63ad6a168 # v1.2.1
+
+  # Shell scripts, workflows, and actions and base images pinned by commit and digest, from kilotronic/lint.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: kilotronic/lint@50d58c6fc3916432a60d6caf5914d5bb83a60a16 # v1.1.0
+
+  # Real authors on this event's commits, in the owner's domains, from kilotronic/git-identity.
+  git-identity:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read # allow-bots on a push asks which pull request a commit merged
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: kilotronic/git-identity@5a7b91c3194870cf535ba8c37a6c93b19b5a933b # v2.3.1
+        with:
+          domains: ixid.net, kilotronic.com
+          allow-bots: dependabot
+
+  # ruff, pyright (strict) and the tests, the canary tests among them. zsh is installed so the
+  # canary's shell-history check runs through a real interactive shell, as on the owner's Mac.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install zsh
+        run: sudo apt-get update -q && sudo apt-get install -y -q zsh
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pyright
+      - run: uv run pytest
+
+  ci:
+    name: ci
+    runs-on: ubuntu-latest
+    needs: [data-leak-check, secret-scan, lint, git-identity, test]
+    if: always()
+    steps:
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "$RESULTS"
+          for r in $RESULTS; do test "$r" = success; done
