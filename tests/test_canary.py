@@ -384,3 +384,32 @@ def test_the_harness_runs_in_its_own_home(canary: Canary) -> None:
         return 0
 
     canary.call(step)
+
+
+def test_a_file_named_after_the_value_is_caught(canary: Canary) -> None:
+    def step(ctx: Context) -> int:
+        (canary.work / canary.value.replace("/", "_")[:20]).write_text("clean")
+        return 0
+
+    with pytest.raises(LeakError, match="file name"):
+        canary.call(step)
+
+
+def test_a_deleted_file_or_a_folder_named_after_the_value_is_caught(canary: Canary) -> None:
+    name = canary.value.replace("/", "_")[:20]
+
+    def deleted(ctx: Context) -> int:
+        p = canary.work / name
+        p.write_text("clean")
+        p.unlink()
+        return 0
+
+    with pytest.raises(LeakError, match="file name"):
+        canary.call(deleted)
+
+    def folder(ctx: Context) -> int:
+        (canary.work / name).mkdir()
+        return 0
+
+    with pytest.raises(LeakError, match="file name"):
+        canary.call(folder)

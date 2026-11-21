@@ -242,8 +242,14 @@ class Canary:
         self.db["items"] = items
         self._save_db()
 
-    def op_create_fails(self, code: int = 1) -> None:
-        self.db["create_fail"] = {"code": code, "stderr": f"[ERROR] {self.value}"}
+    def op_create_fails(self, code: int = 1, *, saved: bool = False) -> None:
+        """The fake `op item create` fails; with saved, the item is listed afterwards anyway,
+        as when op times out after the server saved it."""
+        self.db["create_fail"] = {"code": code, "stderr": f"[ERROR] {self.value}", "saved": saved}
+        self._save_db()
+
+    def op_list_fails(self, code: int = 1) -> None:
+        self.db["list_fail"] = {"code": code, "stderr": f"[ERROR] {self.value}"}
         self._save_db()
 
     def plant(self, rel: str | Path, text: str) -> Path:
@@ -457,12 +463,20 @@ class Canary:
                 channels.append((f"environment of {prog}", env_text.encode()))
             elif e["event"] == "write":
                 self._check_write(Path(e["path"]))
+                channels.append(("a file name", os.fsencode(self._relative(Path(e["path"])))))
         for value in self.secrets():
             for name, data in channels:
                 form = self._leak(value, data)
                 if form:
                     raise LeakError(f"the planted value reached {name} ({form} form)")
+            for path in self._names():
+                form = self._leak(value, os.fsencode(path.relative_to(self.root)))
+                if form and path not in self.planted:
+                    raise LeakError(f"the planted value reached a file name ({form} form)")
             for path in self._files():
+                form = self._leak(value, os.fsencode(path.relative_to(self.root)))
+                if form and path not in self.planted:
+                    raise LeakError(f"the planted value reached a file name ({form} form)")
                 data = path.read_bytes()
                 if self.planted.get(path) == _digest(data):
                     continue
@@ -492,6 +506,21 @@ class Canary:
             raise LeakError(f"keys wrote a temp file ({p})")
         if not (_under(p, self.home.resolve()) or _under(p, self.work.resolve())):
             raise LeakError(f"keys wrote outside the watched folders ({p})")
+
+    def _relative(self, path: Path) -> str:
+        try:
+            return str(path.resolve().relative_to(self.root.resolve()))
+        except ValueError:
+            return str(path)
+
+    def _names(self) -> Iterator[Path]:
+        """Every folder and link under the watched roots, by name."""
+        for root in (self.home, self.tmp, self.work):
+            for dirpath, dirnames, names in os.walk(root):
+                for name in [*dirnames, *names]:
+                    p = Path(dirpath, name)
+                    if p.is_dir() or p.is_symlink():
+                        yield p
 
     def _files(self) -> Iterator[Path]:
         def refuse(e: OSError) -> None:
