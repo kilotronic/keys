@@ -145,11 +145,27 @@ Kinds: `github-app-key`, `github-pat`, `railway-project-token`, `cloudflare-toke
 
 ## Does this text look like a value?
 
-One module, `keys.looks`, answers it for every place keys might repeat text: a field name in a
-mapping error, the flags `keys new` writes to the mapping file, a file name in a scan finding,
-and a service's error code in `keys check`. Text looks like a value when it holds a control or
-unprintable character, a secret shape, a UUID, or a run of 24 or more characters with no space
-that mixes letters and digits (outside a plain link). Each place adds only what it alone knows.
+One module, `keys.looks`, answers it for every place keys might repeat text. Text looks like a
+value when it holds a control or unprintable character, a secret shape, a UUID, or a run of 24
+or more characters with no space that mixes letters and digits. In a link the host is exempt,
+but each piece of its path, query and fragment is held to the same rule.
+
+Where the places differ, and why:
+
+- **Credential names** (the mapping file and `keys new`) also fail when a dash-separated part is
+  longer than 16 characters. A name that looks like a value is refused and never repeated in an
+  error.
+- **Field names** in a mapping error are named only when they are a near miss of a real field
+  (a typo) and pass the rule whole. A `verify` key that mixes letters and digits for 24
+  characters, such as `header_x_api_key_v2_2024abc`, is refused.
+- **Error codes** from a service are shown only when they are 60 plain characters or fewer and
+  pass the rule.
+- **File names** in a scan finding are split on `-`, `_` and `.`, and the long-run rule applies
+  to each piece. Paths are built from words, dates, UUIDs and commit ids, so a UUID or a
+  40-digit commit id counts as plain there, and so does macOS's random per-user temp folder
+  (`/var/folders/<xx>/<folder>/`). Without that, every Claude transcript name would be withheld
+  and there would be nothing to pass to `keys scrub`. Secret shapes and control characters are
+  still withheld, and so is any name holding a known value.
 
 ## The canary tests
 

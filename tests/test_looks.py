@@ -174,16 +174,143 @@ def test_check_drops_an_error_code_shaped_like_a_value(canary: Canary) -> None:
     assert "DEAD (HTTP 401 from api.openai.com/v1/models)" in result.stdout
 
 
-def test_new_refuses_a_uuid_in_the_reason(canary: Canary) -> None:
-    canary.watch(UUID)
-    result = canary.run(["new", "generic", "a", "--vault", "V", "--kept-because", f"x {UUID}"])
+def test_new_refuses_a_key_in_a_link_s_path(canary: Canary) -> None:
+    canary.watch(MIXED_RUN)
+    reason = f"see https://example.com/hooks/{MIXED_RUN}"
+    result = canary.run(["new", "generic", "a", "--vault", "V", "--kept-because", reason])
     assert result.code == 3
     assert not canary.children()
 
 
-def test_new_refuses_a_name_with_a_secret_shape(canary: Canary) -> None:
+def test_new_refuses_a_tab_in_the_owner(canary: Canary) -> None:
     result = canary.run(
         ["new", "generic", "a", "--vault", "V", "--kept-because", "x", "--owner", "ab\tc"]
     )
     assert result.code == 3
     assert not canary.children()
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["new", "generic", "app-" + MIXED_RUN.lower(), "--vault", "V", "--kept-because", "x"],
+        ["new", "generic", "a", "--vault", UUID, "--kept-because", "x"],
+        ["new", "generic", "a", "--vault", GH_SHAPED, "--kept-because", "x"],
+    ],
+)
+def test_new_refuses_a_key_shaped_name_or_vault(canary: Canary, argv: list[str]) -> None:
+    for value in (MIXED_RUN.lower(), UUID, GH_SHAPED):
+        canary.watch(value)
+    result = canary.run(argv)
+    assert result.code == 3
+    assert not canary.children()
+    assert not (canary.work / "keys.toml").exists()
+
+
+# ---------------------------------------------------------------------------- links
+
+DISCORD_TOKEN = "-".join(
+    ["Ab3dEf6hIj9lMn2pQr5tUv8x", "Yz1bC4eF7hI0kL3nO6qR9", "tU2wX5zA8"]
+)  # made up
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"https://discord.com/api/webhooks/1234567890/{DISCORD_TOKEN}",
+        f"https://example.com/v1/{MIXED_RUN}/status",
+        f"https://example.com/page#{MIXED_RUN}",
+    ],
+)
+def test_a_key_in_a_link_s_path_or_fragment_looks_like_a_value(text: str) -> None:
+    assert looks.looks_like_value(text)
+
+
+# ---------------------------------------------------------------------------- real file names
+
+UPPER_UUID = UUID.upper()
+SHA = "0123456789abcdef" * 2 + "01234567"  # 40 hex: a commit id
+TMP_SEGMENT = "zl8x4p0n3x5bh1f2dw7gm7jw" + "0000gn"  # macOS /var/folders/<xx>/<this>/
+
+
+@pytest.mark.parametrize(
+    "part",
+    [
+        f"{UPPER_UUID}.history",
+        f"{UPPER_UUID}.session",
+        f"-private-tmp-claude-501-Users-jason-Code-gh-auditor-{UUID}-scratchpad",
+        f"{UUID}-agent-{UUID}.json",
+        f"{UUID}_{UUID}",
+        SHA,
+    ],
+)
+def test_real_file_names_stay_named(part: str) -> None:
+    assert not looks.file_name_looks_like_value(part)
+
+
+def test_scan_names_real_shaped_files_and_the_macos_temp_folder(canary: Canary) -> None:
+    canary.watch(GH_SHAPED)
+    names = [
+        f".zsh_sessions/{UPPER_UUID}.history",
+        f".claude/projects/-private-tmp-claude-501-x-{UUID}-scratchpad/{UUID}-agent-{UUID}.json",
+        f".claude/file-history/{UUID}_{UUID}/{SHA}/f.txt",
+    ]
+    for rel in names:
+        canary.plant(rel, f"{GH_SHAPED}\n")
+    tmp = canary.root / "private" / "var" / "folders" / "zz" / TMP_SEGMENT / "T"
+    canary.plant(tmp / "claude-501" / "s.txt", f"{GH_SHAPED}\n")
+    result = canary.run(
+        ["scan", "--patterns-only", "--tmp-root", str(canary.tmp), "--path", str(tmp)]
+    )
+    assert result.code == 1
+    for rel in names:
+        assert f"~/{rel}:1: looks like github-token" in result.stdout
+    assert f"/var/folders/zz/{TMP_SEGMENT}/T/claude-501/s.txt:1:" in result.stdout
+    paths = canary.run(["scan", "--paths", "--tmp-root", str(canary.tmp), "--path", str(tmp)])
+    assert f"/var/folders/zz/{TMP_SEGMENT}/T" in paths.stdout
+    assert "withheld" not in paths.stdout
+
+
+# ---------------------------------------------------------------------------- mapping
+
+
+def _mapping_errors(canary: Canary, text: str) -> str:
+    canary.plant(canary.work / "keys.toml", text)
+    result = canary.run(["list"])
+    assert result.code == 3
+    return result.stderr
+
+
+def test_a_mapping_name_shaped_like_a_value_is_refused_and_not_named(canary: Canary) -> None:
+    name = "app-" + SHA
+    canary.watch(SHA)
+    err = _mapping_errors(
+        canary, f'[[credential]]\nname = "{name}"\nkind = "generic"\nitem = "op://V/i"\n'
+    )
+    assert "credential[0].name: looks like a value" in err
+
+
+def test_a_verify_key_shaped_like_a_value_is_refused(canary: Canary) -> None:
+    key = "header_x_api_key_v2_" + "2024abc"
+    err = _mapping_errors(
+        canary,
+        '[[credential]]\nname = "a"\nkind = "generic"\nitem = "op://V/i"\n'
+        '[[credential.target]]\ntype = "github-actions"\nrepo = "o/r"\nsecret = "S"\n'
+        f'verify = {{ {key} = "x" }}\n',
+    )
+    assert "verify: a key that is not a plain name" in err
+
+
+def test_a_near_miss_field_that_is_also_value_shaped_is_not_named(canary: Canary) -> None:
+    near = "exp" + "1r3s"  # within two edits of a field, and mixes letters and digits, but short
+    err = _mapping_errors(
+        canary, f'[[credential]]\nname = "a"\nkind = "generic"\nitem = "op://V/i"\n{near} = 1\n'
+    )
+    assert f"unknown field {near}" in err  # short: plain, so named as a typo
+    long_near = "expires" + "Zx81Qw" * 3  # value-shaped: never named, even if near
+    canary.watch(long_near)
+    err = _mapping_errors(
+        canary,
+        f'[[credential]]\nname = "a"\nkind = "generic"\nitem = "op://V/i"\n{long_near} = 1\n',
+    )
+    assert "an unknown field" in err

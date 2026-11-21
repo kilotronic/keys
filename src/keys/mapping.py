@@ -207,6 +207,10 @@ def _credential(
     elif not isinstance(name, str) or not NAME.fullmatch(name):
         problems.append(f"{where}.name: must be lower-case letters, digits and dashes")
         name = None
+    elif looks.name_looks_like_value(name):
+        # Never repeated back: a value pasted as a name would be printed in every error.
+        problems.append(f"{where}.name: looks like a value; give it a short descriptive name")
+        name = None
     else:
         where = f"{where} ({name})"
         if name in seen:

@@ -8,8 +8,9 @@ error code from a service. Each of those asks here. A text looks like a value wh
 - a secret shape (SHAPES: GitHub, Anthropic, OpenAI, Slack, AWS, Google, Stripe, 1Password
   service-account tokens, private keys);
 - a UUID (Railway tokens are UUIDs);
-- a run of 24 or more characters with no space that mixes letters and digits, outside a plain
-  link (random keys look like this; words and links do not).
+- a run of 24 or more characters with no space that mixes letters and digits (random keys look
+  like this; words do not). In a link, the host is not held to this, but each piece of its
+  path, query and fragment is.
 
 The callers add what only they know: a near miss of a real field name, a dash-separated part
 longer than a name's, the known values a scan reads from 1Password.
@@ -40,10 +41,11 @@ SHAPES: dict[str, re.Pattern[bytes]] = {
     "stripe-key": _rule(r"\b[sr]k_live_[A-Za-z0-9]{20,}"),
 }
 
-UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
-CANONICAL_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-LONG_RUN = re.compile(r"[^\s]{24,}")
-URL = re.compile(r"https?://[A-Za-z0-9.-]+(?:/[A-Za-z0-9._~%/-]*)?(?:#[A-Za-z0-9_-]*)?")
+UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
+LONG = 24  # a run this long with no space, mixing letters and digits, is a key's shape
+RUN = re.compile(r"[^\s]+")
+LINK_HOST = re.compile(r"https?://[A-Za-z0-9.-]+")
+COMMIT = re.compile(r"[0-9a-f]{40}")  # a git commit id: a folder name, never a key
 NAME_PART = 16  # a dash-separated part of a credential's name is never longer
 CODE = re.compile(r"[A-Za-z0-9_.:-]{1,60}")  # what a machine-readable error code may hold
 KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,31}")  # a TOML key keys will name in an error
@@ -53,8 +55,8 @@ def unprintable(text: str) -> bool:
     return any(not c.isprintable() or 0xD800 <= ord(c) <= 0xDFFF for c in text)
 
 
-def _mixed(run: str) -> bool:
-    return any(c.isalpha() for c in run) and any(c.isdigit() for c in run)
+def _long_mixed(run: str) -> bool:
+    return len(run) >= LONG and any(c.isalpha() for c in run) and any(c.isdigit() for c in run)
 
 
 def _shaped(text: str) -> bool:
@@ -62,13 +64,25 @@ def _shaped(text: str) -> bool:
     return any(p.search(data) for p in SHAPES.values())
 
 
+def _pieces(text: str) -> list[str]:
+    """The runs the long-run rule looks at: words split on white space, and a link split at
+    each / # ? & = after its host (a link's host is a name; each piece of its path, query
+    and fragment is held to the same rule as any other run)."""
+    out: list[str] = []
+    for run in RUN.findall(text):
+        host = LINK_HOST.match(run)
+        if host:
+            out += re.split(r"[/#?&=]", run[host.end() :])
+        else:
+            out.append(run)
+    return out
+
+
 def looks_like_value(text: str) -> bool:
     """Whether text could be, or hold, a credential's value."""
-    if unprintable(text):
+    if unprintable(text) or _shaped(text) or UUID.search(text):
         return True
-    if _shaped(text) or UUID.search(text):
-        return True
-    return any(_mixed(run) for run in LONG_RUN.findall(URL.sub(" ", text)))
+    return any(_long_mixed(piece) for piece in _pieces(text))
 
 
 def name_looks_like_value(name: str) -> bool:
@@ -76,20 +90,17 @@ def name_looks_like_value(name: str) -> bool:
     return looks_like_value(name) or any(len(part) > NAME_PART for part in name.split("-"))
 
 
-def file_name_looks_like_value(part: str) -> bool:
-    """One part of a file's path, for a scan finding. The long-run rule applies to each piece
-    between - _ and . (a path's pieces are words, dates and short ids). A canonical lower-case
-    UUID, alone or before an extension, is how Claude names its sessions and file history, and
-    is named, as it always was; a known value in it is still caught by the scan's own check."""
+def file_name_looks_like_value(part: str, *, random_ok: bool = False) -> bool:
+    """One part of a file's path, for a scan finding. Paths are made of words, dates, UUIDs and
+    commit ids joined by - _ and ., so the long-run rule applies to each piece between those,
+    and a UUID or a 40-digit commit id counts as plain. A known value in a name is still caught
+    by the scan's own check, which reads the values from 1Password. random_ok skips the
+    long-run rule, for a folder the system names at random (macOS's per-user temp folder)."""
     if unprintable(part) or _shaped(part):
         return True
-    stem = part.split(".", 1)[0]
-    rest = part[len(stem) :]
-    if CANONICAL_UUID.fullmatch(stem) and not looks_like_value(rest):
-        return False
-    if UUID.search(part):
-        return True
-    return any(len(piece) >= 24 and _mixed(piece) for piece in re.split(r"[-_.]", part))
+    return not random_ok and any(
+        _long_mixed(piece) and not COMMIT.fullmatch(piece) for piece in re.split(r"[-_.]", part)
+    )
 
 
 def plain_code(code: str) -> bool:

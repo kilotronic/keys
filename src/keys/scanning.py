@@ -294,22 +294,30 @@ def scan_roots(args: argparse.Namespace, ctx: Context) -> list[Path]:
     return unique
 
 
-def _clean(part: str) -> str:
-    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in part)
+def _macos_temp(parts: tuple[str, ...]) -> set[int]:
+    """The index of each random folder in a macOS /var/folders/<xx>/<random>/ temp path. It is
+    the system's per-user folder name, shown so the owner can find the file."""
+    return {
+        i + 3
+        for i in range(len(parts) - 3)
+        if parts[i : i + 2] == ("var", "folders") and len(parts[i + 2]) == 2
+    }
 
 
 def shown(path: Path, home: Path, s: Searcher | None = None) -> str:
-    """path for printing: under ~/ when it can be, control characters escaped, and any part
-    that holds a value or a secret shape withheld."""
+    """path for printing: under ~/ when it can be, and any part that holds a known value, or
+    looks like one (keys.looks; a control character among them), withheld."""
     try:
         parts, prefix = path.relative_to(home).parts, "~/"
     except ValueError:
         parts, prefix = path.parts, ""
+    temp = _macos_temp(parts)
     out = [
         "<name withheld>"
-        if looks.file_name_looks_like_value(part) or (s is not None and s.holds(os.fsencode(part)))
-        else _clean(part)
-        for part in parts
+        if (s is not None and s.holds(os.fsencode(part)))
+        or looks.file_name_looks_like_value(part, random_ok=i in temp)
+        else part
+        for i, part in enumerate(parts)
     ]
     text = "/".join(out)
     return prefix + text if prefix else ("/" + text.lstrip("/") if path.is_absolute() else text)
