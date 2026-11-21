@@ -267,6 +267,23 @@ class Canary:
         self.db["fail"][ref] = {"code": code, "stderr": stderr or f"[ERROR] {self.value}"}
         self._save_db()
 
+    def kv_value(self, vault: str, name: str, value: str | None) -> None:
+        """The fake az answers `az keyvault secret show` for vault/name with value (None: a
+        secret with no value, which az prints as null)."""
+        ref = f"kv://{vault}/{name}"
+        if value is None:
+            self.db["values"][ref] = None
+            self._save_db()
+        else:
+            self.op_value(ref, value)
+
+    def kv_fail(self, vault: str, name: str, code: int = 1, *, stdout: bool = False) -> None:
+        """The fake az fails to show vault/name; its error text holds the canary, and with
+        stdout it also prints the canary on its stdout before failing."""
+        self.op_fail(f"kv://{vault}/{name}", code)
+        self.db["fail"][f"kv://{vault}/{name}"]["stdout"] = self.value if stdout else ""
+        self._save_db()
+
     def op_items(self, items: list[dict[str, Any]]) -> None:
         """What the fake `op item list --format json` prints."""
         self._load_db()

@@ -9,8 +9,10 @@ console shows, and the verdict with the HTTP status and error code. Exit 0 for W
 from __future__ import annotations
 
 import argparse
+import json
+import re
 
-from keys import probes
+from keys import leaks, probes, proc
 from keys.context import EXIT_FAIL, EXIT_OK, EXIT_UNKNOWN, Context, UsageError
 from keys.fingerprint import fingerprint, hint
 from keys.op import Op, OpError
@@ -18,12 +20,18 @@ from keys.secret import Secret
 
 FP_KEY_MIN = 16
 SOURCES = "op://<vault>/<item>/<field>, env:NAME or stdin"
+# Only for the key being checked, never the fingerprint key.
+KEY_SOURCES = (
+    "op://<vault>/<item>/<field>, kv://<vault>/<secret>, env:NAME, stdin or "
+    "gitleaks:<report.json>#<fingerprint>"
+)
+KV = re.compile(r"kv://([A-Za-z0-9-]{3,24})/([A-Za-z0-9-]{1,127})")
 
 
 def configure(p: argparse.ArgumentParser) -> None:
     p.add_argument("service", nargs="?", help="a service; --list names them")
     p.add_argument("--list", action="store_true", help="list the services and what each asks")
-    p.add_argument("--key", metavar="SOURCE", help=f"where the key comes from: {SOURCES}")
+    p.add_argument("--key", metavar="SOURCE", help=f"where the key comes from: {KEY_SOURCES}")
     p.add_argument(
         "--fp-key",
         metavar="SOURCE",
@@ -39,9 +47,17 @@ def configure(p: argparse.ArgumentParser) -> None:
     p.add_argument("--dead-status")
 
 
-def read_key(source: str, ctx: Context, what: str = "key") -> Secret:
-    """The value a source names. Errors never hold the source or the value."""
-    if source.startswith("op://"):
+def read_key(source: str, ctx: Context, what: str = "key", fp_key: Secret | None = None) -> Secret:
+    """The value a source names. Errors never hold the source or the value. kv:// and
+    gitleaks: are for a key being checked (fp_key given), never for the fingerprint key."""
+    if fp_key is not None and source.startswith("kv://"):
+        m = KV.fullmatch(source)
+        if m is None:
+            raise UsageError("kv:// takes kv://<vault>/<secret> (letters, digits and dashes)")
+        return _key_vault(m.group(1), m.group(2), ctx)  # exactly as stored, newlines kept
+    elif fp_key is not None and source.startswith("gitleaks:"):
+        return leaks.from_report(source.removeprefix("gitleaks:"), fp_key, ctx)
+    elif source.startswith("op://"):
         try:
             value = Op(ctx.environ).read(source)
         except OpError as e:
@@ -60,7 +76,8 @@ def read_key(source: str, ctx: Context, what: str = "key") -> Secret:
         text = ctx.stdin.read()
     else:
         # Not echoed: a value typed here by mistake would be printed back.
-        raise UsageError(f"unknown key source for the {what}: use {SOURCES}")
+        sources = KEY_SOURCES if fp_key is not None else SOURCES
+        raise UsageError(f"unknown key source for the {what}: use {sources}")
     text = text.rstrip("\r\n")
     if not text:
         raise UsageError(f"the {what} is empty")
@@ -71,6 +88,48 @@ def fp_key_variable(flag: str | None, ctx: Context) -> str | None:
     """The environment variable the fingerprint key comes from, if it comes from one."""
     source = flag or ctx.environ.get("KEYS_FP_KEY") or ""
     return source[4:] if source.startswith("env:") else None
+
+
+# What az may see besides the basics: where its sign-in lives, and how it reaches the network.
+AZ_ENV = (
+    "AZURE_CONFIG_DIR",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "no_proxy",
+    "REQUESTS_CA_BUNDLE",
+)
+# az's exit codes, told in keys's own words: az's text is never shown.
+AZ_EXITS = {
+    1: "not signed in (az login), no access to that vault, or another az error",
+    2: "az did not understand the command (an az too old?)",
+    3: "no such secret in that vault",
+}
+
+
+def _key_vault(vault: str, name: str, ctx: Context) -> Secret:
+    """A Key Vault secret's value, exactly as stored, captured from az's JSON output under the
+    owner's az sign-in. az's error text and anything it prints when it fails are never kept."""
+    argv = ["az", "keyvault", "secret", "show", "--vault-name", vault, "--name", name]
+    argv += ["--query", "value", "--output", "json"]
+    try:
+        env = proc.child_env(ctx.environ)
+        env.update({k: ctx.environ[k] for k in AZ_ENV if k in ctx.environ})  # exact names only
+        done = proc.run(argv, env)
+    except proc.ChildError as e:
+        raise UsageError(f"could not read the key from Key Vault: {e}") from None
+    if done.code != 0:
+        why = AZ_EXITS.get(done.code, "an az error")
+        raise UsageError(f"could not read the key from Key Vault: az exited {done.code} ({why})")
+    try:
+        value: object = json.loads(done.stdout)
+    except ValueError:
+        raise UsageError("could not read the key from Key Vault: az printed no JSON") from None
+    if not isinstance(value, str) or not value:
+        raise UsageError("that Key Vault secret has no value")
+    return Secret(value)
 
 
 def read_fp_key(flag: str | None, ctx: Context) -> Secret:
@@ -98,11 +157,11 @@ def run(args: argparse.Namespace, ctx: Context) -> int:
     if provider is None:
         raise UsageError("unknown service; `keys check --list` names them")
     if not args.key:
-        raise UsageError(f"--key is required: {SOURCES}")
+        raise UsageError(f"--key is required: {KEY_SOURCES}")
     if args.key == "stdin" and (args.fp_key or ctx.environ.get("KEYS_FP_KEY")) == "stdin":
         raise UsageError("the key and the fingerprint key cannot both come from stdin")
     fp_key = read_fp_key(args.fp_key, ctx)
-    key = read_key(args.key, ctx)
+    key = read_key(args.key, ctx, fp_key=fp_key)
     opts = probes.Options(
         client_id=args.client_id,
         account=args.account,
