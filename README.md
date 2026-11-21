@@ -594,8 +594,10 @@ Agents sign in to GitHub as an App instead of the owner's own login (design: the
   1Password into one login-keychain item (`keys:<name>`), through `security -i` on stdin, so
   minting never asks for Touch ID. It then signs in as the App once to prove the key.
 - `keys gh [--app NAME] -- <gh args>` mints a one-hour installation token for the call's owner
-  (from `-R`, `--repo=`, `$GH_REPO`, a github.com URL, a `gh api` path, the current repo's
-  `origin`, else `$KEYS_GH_DEFAULT_OWNER`), runs the real `gh` with it as `GH_TOKEN` in gh's
+  (from `-R`, `--repo=`, `$GH_REPO`, a github.com URL, a `gh api` path, `--owner` (as
+  `gh project` takes it; the token then covers the whole installation), `$KEYS_GH_OWNER` (for a
+  call that names no owner, such as `gh project item-edit`: set it once for a script), the current
+  repo's `origin`, else `$KEYS_GH_DEFAULT_OWNER`), runs the real `gh` with it as `GH_TOKEN` in gh's
   environment only (dropping `GITHUB_TOKEN` and `GITHUB_PERSONAL_ACCESS_TOKEN`), and revokes it
   when gh ends. `gh auth token|login|refresh|switch` are refused. The real `gh` is
   `$KEYS_REAL_GH`, else the first `gh` on `PATH` that is not a shim calling `keys gh`.
