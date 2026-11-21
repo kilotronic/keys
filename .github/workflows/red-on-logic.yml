@@ -11,8 +11,15 @@ on:
 permissions:
   contents: read
 
+# A new push or label supersedes the last run's answer.
+concurrency:
+  group: red-on-logic-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   red-on-logic:
+    # Dependabot's updates change no tests and cannot add a skip trailer.
+    if: github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
