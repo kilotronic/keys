@@ -8,7 +8,9 @@ What it watches, for `run`/`call` (in this process) and `shell` (a real interact
 - the text of any exception that escapes (which also fails the test on its own);
 - every child process, recorded when it starts by an audit hook (`canary_hook.py`): its argv
   and environment must not hold the value, and its program must be one of the harness's fakes
-  on PATH; data piped to a child is allowed only for `op item create` and `op item edit`;
+  on PATH; data piped to a child is allowed only for 1Password's item writes and each target's
+  write command (`gh secret set`, `railway variable set`, `az keyvault secret set`,
+  `gcloud secrets versions add` and `gcloud secrets create`);
 - every file opened for writing: none may be under the temp folder or outside the temporary home
   and working folder, and after the run no file there may hold the value, unless the test
   planted it and it is unchanged;
@@ -57,7 +59,31 @@ ENCODED_PIECE = 12
 HERE = Path(__file__).parent
 FAKE_CHILD = HERE / "fake_child.py"
 FAKE_PROGRAMS = ("op", "gh", "railway", "az", "gcloud", "security", "pbcopy")
-STDIN_OK = {("op", "item", "create"), ("op", "item", "edit")}
+# The only children that may be handed a value on stdin: 1Password's item writes and each
+# target's write command, matched on their leading words (so `az keyvault secret show` is not).
+STDIN_OK = (
+    ("op", "item", "create"),
+    ("op", "item", "edit"),
+    ("gh", "secret", "set"),
+    ("railway", "variable", "set"),
+    ("az", "keyvault", "secret", "set"),
+    ("gcloud", "secrets", "versions", "add"),
+    ("gcloud", "secrets", "create"),
+)
+
+
+# A write that would print what it sends (debug, verbose or HTTP logging) is never allowed one.
+NOISY_FLAGS = ("--debug", "--verbose", "--verbosity", "--log-http", "--trace")
+
+
+def stdin_ok(argv: Sequence[str]) -> bool:
+    if any(a.split("=", 1)[0] in NOISY_FLAGS for a in argv):
+        return False
+    words = tuple(a for a in argv if not a.startswith("-"))
+    return any(words[: len(ok)] == ok for ok in STDIN_OK)
+
+
+ITEM_WRITES = STDIN_OK[:2]  # op item create and edit take item JSON, checked like any channel
 
 
 class LeakError(AssertionError):
@@ -148,6 +174,8 @@ class Child:
     prog: str
     argv: list[str]
     stdin: str
+    env: list[str] = field(default_factory=lambda: list[str]())  # names only
+    target: str = ""  # the fake target a write landed on (see fake_child.target_key)
 
 
 @dataclass
@@ -222,6 +250,7 @@ class Canary:
     def op_value(self, ref: str, value: str) -> None:
         """The fake op answers `op read ref` with value; a value other than the canary is
         watched for too."""
+        self._load_db()
         self.db["values"][ref] = value
         if value != self.value and value not in self.extra_values:
             self.extra_values.append(value)
@@ -234,23 +263,66 @@ class Canary:
 
     def op_fail(self, ref: str, code: int = 1, stderr: str | None = None) -> None:
         """The fake op fails `op read ref`; by default its error text holds the canary."""
+        self._load_db()
         self.db["fail"][ref] = {"code": code, "stderr": stderr or f"[ERROR] {self.value}"}
         self._save_db()
 
     def op_items(self, items: list[dict[str, Any]]) -> None:
         """What the fake `op item list --format json` prints."""
+        self._load_db()
         self.db["items"] = items
         self._save_db()
 
     def op_create_fails(self, code: int = 1, *, saved: bool = False) -> None:
         """The fake `op item create` fails; with saved, the item is listed afterwards anyway,
         as when op times out after the server saved it."""
+        self._load_db()
         self.db["create_fail"] = {"code": code, "stderr": f"[ERROR] {self.value}", "saved": saved}
         self._save_db()
 
     def op_list_fails(self, code: int = 1) -> None:
+        self._load_db()
         self.db["list_fail"] = {"code": code, "stderr": f"[ERROR] {self.value}"}
         self._save_db()
+
+    def child_fails(self, words: list[str], code: int = 1) -> None:
+        """A fake child whose program and leading words are these fails with code; its error
+        text holds the canary."""
+        self.db.setdefault("child_fail", []).append(
+            {"words": words, "code": code, "stderr": f"error: {self.value}"}
+        )
+        self._save_db()
+
+    def target_put(self, key: str, value: str, **meta: Any) -> None:
+        """A secret already at a target, under the fake's key (see fake_child.target_key):
+        `gh:<repo>:<name>`, `gh:<repo>:env:<env>:<name>`, `gh:org:<org>:<name>`,
+        `railway:<project>:<service>:<environment>:<name>`, `az:<vault>:<name>`,
+        `gcp:<project>:<name>`."""
+        self._load_db()
+        entry = {"value": value, "updated_at": "2026-01-01T00:00:00Z", "writes": 0, **meta}
+        self.db.setdefault("targets", {})[key] = entry
+        self.watch(value)
+        self._save_db()
+
+    def target(self, key: str) -> dict[str, Any] | None:
+        """What the fake target under key holds now (value, updated_at, writes, tags, ...)."""
+        self._load_db()
+        found: dict[str, Any] | None = self.db.get("targets", {}).get(key)
+        return found
+
+    def deploys(self, key: str) -> list[dict[str, str]]:
+        """A Railway scope's deployments, newest first; key is `railway:<p>:<s>:<e>:`."""
+        self._load_db()
+        found: list[dict[str, str]] = self.db.get("deploys", {}).get(f"deploys:{key}", [])
+        return found
+
+    def set_db(self, name: str, value: Any) -> None:
+        self._load_db()
+        self.db[name] = value
+        self._save_db()
+
+    def _load_db(self) -> None:
+        self.db = json.loads(self.db_path.read_text())
 
     def plant(self, rel: str | Path, text: str) -> Path:
         """A file allowed to hold the value while unchanged: under the temporary home when
@@ -282,7 +354,9 @@ class Canary:
         for line in self.log_path.read_text().splitlines():
             row = json.loads(line)
             if "argv" in row:
-                started[row["id"]] = Child(row["prog"], row["argv"], "")
+                started[row["id"]] = Child(row["prog"], row["argv"], "", row.get("env", []))
+            elif row["id"] in started and "target" in row:
+                started[row["id"]].target = row["target"]
             elif row["id"] in started:
                 started[row["id"]].stdin = row["stdin"]
         return list(started.values())
@@ -437,6 +511,14 @@ class Canary:
 
     # ------------------------------------------------------------------ checking
 
+    def _expected_write(self, data: str) -> bool:
+        """A target write carries exactly one value 1Password holds (the canary or an
+        op_value), as read or with its trailing line breaks removed (keys's one change)."""
+        for v in [self.value, *self.db.get("values", {}).values()]:
+            if v and data in (v, v.rstrip("\n")):
+                return True
+        return False
+
     def secrets(self) -> list[str]:
         return [self.value, *self.extra_values]
 
@@ -451,9 +533,12 @@ class Canary:
         if escaped is not None:
             channels.append(("exception", escaped.encode()))
         for c in result.children:
-            words = tuple(a for a in c.argv if not a.startswith("-"))[:3]
-            if words not in STDIN_OK:
-                channels.append((f"stdin of {c.prog}", c.stdin.encode()))
+            words = tuple(a for a in c.argv if not a.startswith("-"))
+            if not stdin_ok(c.argv) or any(words[: len(w)] == w for w in ITEM_WRITES):
+                if not stdin_ok(c.argv):
+                    channels.append((f"stdin of {c.prog}", c.stdin.encode()))
+            elif c.stdin and not self._expected_write(c.stdin):
+                raise LeakError(f"the stdin of {c.prog} is not exactly one value 1Password holds")
             channels.append((f"argv of {c.prog}", "\0".join(c.argv).encode()))
         for e in events:
             if e["event"] == "spawn":
