@@ -8,42 +8,24 @@ error from a failed child or request can carry the value it was handling.
 from __future__ import annotations
 
 import argparse
-import datetime
-import os
 import sys
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
-from typing import IO, TYPE_CHECKING, NoReturn
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, NoReturn
 
 if TYPE_CHECKING:
     from _typeshed import SupportsWrite
 
-EXIT_OK, EXIT_FAIL, EXIT_UNKNOWN, EXIT_USAGE, EXIT_INTERNAL = 0, 1, 2, 3, 4
+from keys import listing
+from keys.context import (
+    EXIT_INTERNAL,
+    EXIT_OK,
+    EXIT_USAGE,
+    Context,
+    UsageError,
+)
+from keys.mapping import MappingError
 
-
-class UsageError(Exception):
-    """A mistake in how keys was called or configured. Its message never holds a value."""
-
-
-def _today() -> datetime.date:
-    return datetime.date.today()
-
-
-@dataclass
-class Context:
-    """What a command reads from and writes to; tests swap in their own."""
-
-    stdout: IO[str] = field(default_factory=lambda: sys.stdout)
-    stderr: IO[str] = field(default_factory=lambda: sys.stderr)
-    stdin: IO[str] = field(default_factory=lambda: sys.stdin)
-    environ: Mapping[str, str] = field(default_factory=lambda: os.environ)
-    today: Callable[[], datetime.date] = _today
-
-    def say(self, line: str) -> None:
-        print(line, file=self.stdout, flush=True)
-
-    def warn(self, line: str) -> None:
-        print(line, file=self.stderr, flush=True)
+__all__ = ["Context", "UsageError", "main"]
 
 
 class _Parser(argparse.ArgumentParser):
@@ -96,7 +78,9 @@ def _parser(ctx: Context, argv: Sequence[str]) -> _Parser:
         p.ctx, p.argv = ctx, argv
         return p
 
-    add("list", "every credential in the mapping file: fingerprint, expiry, lifetime, problems")
+    listing.configure(
+        add("list", "every credential in the mapping file: fingerprint, expiry, lifetime, problems")
+    )
     add("check", "ask a service whether a key works, without printing the key")
     add("scan", "search transcripts, history and logs for known values and secret shapes")
     add("scrub", "replace found values in one file with a marker, in place")
@@ -109,6 +93,8 @@ def run(argv: Sequence[str], ctx: Context) -> int:
     command: str | None = args.command
     if command is None:
         raise UsageError("usage: keys <command> [options]; `keys --help` lists the commands")
+    if command == "list":
+        return listing.run(args, ctx)
     raise UsageError(f"keys {command} is not built yet")
 
 
@@ -122,6 +108,10 @@ def main(argv: Sequence[str] | None = None, ctx: Context | None = None) -> int:
         return EXIT_OK if e.status == 0 else EXIT_USAGE
     except UsageError as e:
         ctx.warn(f"keys: {e}")
+        return EXIT_USAGE
+    except MappingError as e:
+        for problem in e.problems:
+            ctx.warn(f"keys: {problem}")
         return EXIT_USAGE
     except KeyboardInterrupt:
         ctx.warn("keys: interrupted")

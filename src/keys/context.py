@@ -1,0 +1,41 @@
+"""What every command shares: its streams, environment and clock, and its error type."""
+
+from __future__ import annotations
+
+import datetime
+import os
+import sys
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import IO
+
+EXIT_OK, EXIT_FAIL, EXIT_UNKNOWN, EXIT_USAGE, EXIT_INTERNAL = 0, 1, 2, 3, 4
+
+
+class UsageError(Exception):
+    """A mistake in how keys was called or configured. Its message never holds a value."""
+
+
+def _today() -> datetime.date:
+    return datetime.date.today()
+
+
+@dataclass
+class Context:
+    """What a command reads from and writes to; tests swap in their own."""
+
+    stdout: IO[str] = field(default_factory=lambda: sys.stdout)
+    stderr: IO[str] = field(default_factory=lambda: sys.stderr)
+    stdin: IO[str] = field(default_factory=lambda: sys.stdin)
+    environ: Mapping[str, str] = field(default_factory=lambda: os.environ)
+    today: Callable[[], datetime.date] = _today
+
+    def say(self, line: str) -> None:
+        print(line, file=self.stdout, flush=True)
+
+    def warn(self, line: str) -> None:
+        print(line, file=self.stderr, flush=True)
+
+    def cwd(self) -> Path:
+        return Path.cwd()
