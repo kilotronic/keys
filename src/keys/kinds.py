@@ -13,15 +13,28 @@ class Kind:
     about: str
     fields: tuple[str, ...] = ()  # the non-secret fields the item also has
     provider_issued: bool = True  # a provider made it, so its console shows a hint
+    # The provider can set an expiry on it. When not, the rotation date counts: it expires
+    # 180 days after it was rotated.
+    can_expire: bool = False
 
 
 KINDS: dict[str, Kind] = {
     k.name: k
     for k in [
         Kind("github-app-key", "a GitHub App's private key", ("app_id", "client_id")),
-        Kind("github-pat", "a GitHub fine-grained personal access token", ("owner",)),
+        Kind(
+            "github-pat",
+            "a GitHub fine-grained personal access token",
+            ("owner",),
+            can_expire=True,
+        ),
         Kind("railway-project-token", "a Railway project token", ("project_id", "environment")),
-        Kind("cloudflare-token", "a Cloudflare API token", ("token_id", "account_id")),
+        Kind(
+            "cloudflare-token",
+            "a Cloudflare API token",
+            ("token_id", "account_id"),
+            can_expire=True,
+        ),
         Kind("generic", "any other credential", (), provider_issued=False),
     ]
 }

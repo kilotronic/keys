@@ -40,10 +40,13 @@ place would be printed back: `keys: credential[0] (app-mail).expires: must be a 
 ### `keys list`
 
 Every credential, its fingerprint, expiry, days left and lifetime, and what is wrong with it.
-It exits 1 on any problem: no expiry, expired, a lifetime or age over 180 days, an expiry more
-than 180 days away, no `kept_because`, or more kept credentials than `kept_budget`. From day 120
-a credential shows as due, without failing. It reads only the mapping file, and never prints
-its text fields.
+It exits 1 on any problem: no expiry, expired or expiring today, a lifetime or age over 180
+days, an expiry more than 180 days away, a rotation date in the future or after the expiry, no
+`kept_because`, more kept credentials than `kept_budget`, or no credentials at all. For a kind
+whose provider cannot set an expiry (a GitHub App key, a Railway token, `generic`), the expiry
+is 180 days after `rotated`. From day 120 a credential shows as due, without failing. It reads
+only the mapping file and never prints its text fields, nor a path given to it (either could be
+a value pasted in the wrong place).
 
 ```text
 NAME       KIND        FP           EXPIRES     LEFT  LIFETIME  NOTES

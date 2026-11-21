@@ -30,6 +30,7 @@ import dataclasses
 import datetime
 import re
 import tomllib
+from collections.abc import Iterable
 from collections.abc import Mapping as AnyMapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -113,11 +114,20 @@ class Mapping:
     kept_budget: int | None = None
 
 
-def _unknown(where: str, key: str) -> str:
-    # A key is usually a name, but a value pasted as a key would be printed back; show only
-    # keys that look like field names.
-    shown = f"unknown field {key}" if SAFE_KEY.match(key) else "an unknown field"
-    return f"{where}: {shown}"
+def _distance(a: str, b: str) -> int:
+    row = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        prev, row[0] = row[0], i
+        for j, cb in enumerate(b, 1):
+            prev, row[j] = row[j], min(row[j] + 1, row[j - 1] + 1, prev + (ca != cb))
+    return row[-1]
+
+
+def _unknown(where: str, key: str, known: Iterable[str]) -> str:
+    # A value pasted as a key would be printed back, and many keys look like field names; so
+    # name the key only when it is a near miss of a real field (a typo).
+    near = SAFE_KEY.fullmatch(key) and any(_distance(key, k) <= 2 for k in known)
+    return f"{where}: unknown field {key}" if near else f"{where}: an unknown field"
 
 
 def _text(where: str, value: object, problems: list[str]) -> str:
@@ -140,7 +150,7 @@ def _target(where: str, raw: object, problems: list[str]) -> Target | None:
         return None
     t = cast(dict[str, Any], raw)
     kind = t.get("type")
-    if kind not in TARGETS:
+    if not isinstance(kind, str) or kind not in TARGETS:
         problems.append(f"{where}.type: must be one of {', '.join(TARGETS)}")
         return None
     required, optional = TARGETS[kind]
@@ -148,7 +158,7 @@ def _target(where: str, raw: object, problems: list[str]) -> Target | None:
     fields: dict[str, str | list[str]] = {}
     for key in t:
         if key not in allowed:
-            problems.append(_unknown(where, key))
+            problems.append(_unknown(where, key, allowed))
     for key in required:
         if key not in t:
             problems.append(f"{where}.{key}: missing")
@@ -172,10 +182,12 @@ def _target(where: str, raw: object, problems: list[str]) -> Target | None:
             problems.append(f"{where}.verify: must be a table")
         else:
             for k, v in cast(dict[str, object], t["verify"]).items():
-                if not SAFE_KEY.match(k):
-                    problems.append(_unknown(f"{where}.verify", k))
+                if not SAFE_KEY.fullmatch(k):
+                    problems.append(f"{where}.verify: a key that is not a plain name")
+                elif isinstance(v, str):
+                    verify[k] = v
                 else:
-                    verify[k] = _text(f"{where}.verify.{k}", v, problems)
+                    problems.append(f"{where}.verify: each value must be text")
     return Target(kind, fields, verify)
 
 
@@ -192,7 +204,7 @@ def _credential(
     name = c.get("name")
     if name is None:
         problems.append(f"{where}.name: missing")
-    elif not isinstance(name, str) or not NAME.match(name):
+    elif not isinstance(name, str) or not NAME.fullmatch(name):
         problems.append(f"{where}.name: must be lower-case letters, digits and dashes")
         name = None
     else:
@@ -204,14 +216,14 @@ def _credential(
 
     for key in c:
         if key not in CREDENTIAL_FIELDS:
-            problems.append(_unknown(where, key))
+            problems.append(_unknown(where, key, CREDENTIAL_FIELDS))
 
     kind = c.get("kind")
     if kind is None:
         problems.append(
             f"credential[{i}].kind: missing" if name is None else f"{where}.kind: missing"
         )
-    elif kind not in KINDS:
+    elif not isinstance(kind, str) or kind not in KINDS:
         problems.append(f"{where}.kind: must be one of {', '.join(KINDS)}")
 
     vault = title = ""
@@ -219,7 +231,7 @@ def _credential(
     if item is None:
         problems.append(f"{where}.item: missing")
     else:
-        m = ITEM.match(item) if isinstance(item, str) else None
+        m = ITEM.fullmatch(item) if isinstance(item, str) else None
         if m is None:
             problems.append(f"{where}.item: must be op://<vault>/<item>, with no field")
         else:
@@ -228,7 +240,7 @@ def _credential(
     value_field = VALUE_FIELD
     if "field" in c:
         value_field = _text(f"{where}.field", c["field"], problems)
-        if value_field and not LABEL.match(value_field):
+        if value_field and not LABEL.fullmatch(value_field):
             problems.append(f"{where}.field: must be a 1Password field label")
     owner = _text(f"{where}.owner", c["owner"], problems) if "owner" in c else ""
     kept = (
@@ -237,7 +249,7 @@ def _credential(
     fp = ""
     if "fp" in c:
         fp = c["fp"] if isinstance(c["fp"], str) else ""
-        if not FP.match(fp):
+        if not FP.fullmatch(fp):
             problems.append(f"{where}.fp: must be 8 lower-case hex digits")
     rotated = _date(f"{where}.rotated", c["rotated"], problems) if "rotated" in c else None
     expires = _date(f"{where}.expires", c["expires"], problems) if "expires" in c else None
@@ -273,7 +285,7 @@ def parse(doc: AnyMapping[str, Any], path: Path) -> Mapping:
     problems: list[str] = []
     for key in doc:
         if key not in TOP_FIELDS:
-            problems.append(_unknown("mapping file", key))
+            problems.append(_unknown("mapping file", key, TOP_FIELDS))
     budget = doc.get("kept_budget")
     if budget is not None and (type(budget) is not int or budget < 0):
         problems.append("kept_budget: must be a whole number, 0 or more")
@@ -293,22 +305,23 @@ def parse(doc: AnyMapping[str, Any], path: Path) -> Mapping:
     return Mapping(path, credentials, budget)
 
 
-def load(path: Path) -> Mapping:
+def load(path: Path, shown: str | None = None) -> Mapping:
+    """The mapping file at path. Errors call it `shown` (default: the path itself), since a
+    path typed or set by the owner could be a value pasted into the wrong place."""
+    name = shown or str(path)
     try:
         data = path.read_bytes()
     except FileNotFoundError:
-        raise MappingError([f"no mapping file at {path}"]) from None
+        raise MappingError([f"no mapping file at {name}"]) from None
     except OSError as e:
-        raise MappingError(
-            [f"cannot read the mapping file at {path} ({type(e).__name__})"]
-        ) from None
+        raise MappingError([f"cannot read {name} ({type(e).__name__})"]) from None
     try:
         doc = tomllib.loads(data.decode("utf-8"))
     except UnicodeDecodeError:
-        raise MappingError([f"{path}: not UTF-8 text"]) from None
+        raise MappingError([f"{name}: not UTF-8 text"]) from None
     except tomllib.TOMLDecodeError as e:
         # The decoder's message can quote the text it choked on; keep only where.
         m = re.search(r"line (\d+), column (\d+)", str(e))
         at = f" at line {m.group(1)}, column {m.group(2)}" if m else ""
-        raise MappingError([f"{path}: not valid TOML{at}"]) from None
+        raise MappingError([f"{name}: not valid TOML{at}"]) from None
     return parse(doc, path)
