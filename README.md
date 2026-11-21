@@ -82,6 +82,39 @@ github key fp:3f9a1c02 github_p…Ab3d: DEAD (HTTP 401 from api.github.com/rate_
 - Exit 0 for WORKS (or the `--expect` verdict), 1 for DEAD (or the other), 2 for UNKNOWN, 3 for
   a usage error.
 
+### `keys scan`
+
+Searches the places an agent's or a shell's words are kept, all of them backed up and outliving
+any key: `~/.claude` (transcripts, typed-prompt history, file history, shell snapshots, debug
+logs), Claude's temp and scratch folders (`claude*` under `$TMPDIR`, `/tmp`, `/private/tmp`),
+the Claude desktop app's logs and support folder, Cursor's agent folders, shell history, and
+saved Terminal, iTerm2 and tmux state. `keys scan --paths` lists them; `--path` adds one.
+
+Two passes over each line. First every credential in the mapping file, read in memory from
+1Password and searched for as sent and in its URL-encoded, JSON-escaped, base64 and hex forms;
+that catches what no pattern can, such as a random signing secret. Then pattern rules for secret
+shapes (GitHub, Anthropic, OpenAI, Slack, AWS, Google, Stripe and 1Password service-account
+tokens, private keys). A finding names the file, the line and the credential or rule, never the
+text it matched:
+
+```text
+~/.claude/projects/<project>/<session>.jsonl:412: app-mail (known value)
+~/.zsh_history:9031: looks like github-token
+keys scan: 18234 files, 2 findings
+```
+
+Exit 1 on any finding, 2 when a value could not be read from 1Password (so the scan is
+incomplete), 0 when clean. `--patterns-only` skips 1Password.
+
+The response to a finding: rotate that key (backups already hold it), then scrub the file.
+
+### `keys scrub <file>`
+
+Replaces every match in one file (each known value in each form, and each pattern match) with
+`[removed by keys scrub]`, in place, keeping the file's permissions, and prints only how many it
+replaced. Nobody opens the file to redact it by hand, which would copy the value into a new
+transcript.
+
 ## The canary tests
 
 Every command's tests run through one harness, `tests/canary.py`. It plants a made-up value in
