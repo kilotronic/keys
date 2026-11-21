@@ -1,0 +1,29 @@
+name: red-on-logic
+
+# A pilot of kilotronic/red-on-logic: a pull request's new or changed tests must fail on the base
+# branch's code with a wrong answer, not an import error. It is not part of `ci`, so it is not
+# required; the owner decides that after the pilot. Labels re-run it: a label
+# `red-on-logic: not applicable (<reason>)`, or the same line as a commit trailer, skips it.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  red-on-logic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # the base commit and the pull request's commit messages
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          python-version: "3.14"
+      - name: Install zsh
+        run: sudo apt-get update -q && sudo apt-get install -y -q zsh
+      - run: uv sync --frozen
+      - uses: kilotronic/red-on-logic@e2381dc7723346fa5c4d9389fbe79966b433c7df # v1.0.0
