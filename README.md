@@ -75,6 +75,8 @@ github key fp:3f9a1c02 github_p…Ab3d: DEAD (HTTP 401 from api.github.com/rate_
   holds no piece of the key, and for a network failure its type. When 1Password fails, only
   `op`'s exit code is shown. Programs keys starts see only a few basic variables of its
   environment, so a key handed to keys in a variable never reaches them.
+- A key goes only over https (plain http only to this machine, never through a proxy), and a
+  redirect is not followed, since following it would send the key on to wherever it points.
 - `keys check --list` names the services. `http` covers any HTTPS API (`--url`, then
   `--header 'Name: {key}'`, `--bearer` or `--query NAME`).
 - Exit 0 for WORKS (or the `--expect` verdict), 1 for DEAD (or the other), 2 for UNKNOWN, 3 for

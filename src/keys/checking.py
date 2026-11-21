@@ -16,6 +16,7 @@ from keys.fingerprint import fingerprint, hint
 from keys.op import Op, OpError
 from keys.secret import Secret
 
+FP_KEY_MIN = 16
 SOURCES = "op://<vault>/<item>/<field>, env:NAME or stdin"
 
 
@@ -52,7 +53,9 @@ def read_key(source: str, ctx: Context, what: str = "key") -> Secret:
             raise UsageError(f"env: takes the name of an environment variable ({what})")
         text = ctx.environ.get(name, "")
         if not text:
-            raise UsageError(f"environment variable {name} is not set ({what})")
+            # The name is not echoed: a value typed after env: by mistake would be printed.
+            flag = "--key" if what == "key" else "--fp-key or $KEYS_FP_KEY"
+            raise UsageError(f"the environment variable named by {flag} is not set")
     elif source == "stdin":
         text = ctx.stdin.read()
     else:
@@ -85,6 +88,8 @@ def run(args: argparse.Namespace, ctx: Context) -> int:
     if args.key == "stdin" and fp_source == "stdin":
         raise UsageError("the key and the fingerprint key cannot both come from stdin")
     fp_key = read_key(fp_source, ctx, "fingerprint key")
+    if len(fp_key) < FP_KEY_MIN:
+        raise UsageError(f"the fingerprint key must be at least {FP_KEY_MIN} characters")
     key = read_key(args.key, ctx)
     opts = probes.Options(
         client_id=args.client_id,
@@ -101,7 +106,7 @@ def run(args: argparse.Namespace, ctx: Context) -> int:
     )
     sender = ctx.send or probes.send
     verdict, reason = probes.check(provider, key, opts, sender)
-    shown = hint(key)
+    shown = hint(key) if provider.hint else ""
     ident = f"fp:{fingerprint(fp_key, key)}" + (f" {shown}" if shown else "")
     ctx.say(f"{service} key {ident}: {verdict} ({reason})")
     if verdict == probes.UNKNOWN:

@@ -14,7 +14,7 @@ import json
 import threading
 import urllib.parse
 from collections.abc import Generator
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -351,7 +351,7 @@ def test_the_key_on_stdin(c: Canary) -> None:
     ("source", "env", "message"),
     [
         (KEY, {}, "unknown key source"),  # the value itself, typed by mistake: not echoed
-        ("env:MISSING", {}, "environment variable MISSING is not set"),
+        ("env:MISSING", {}, "the environment variable named by --key is not set"),
         ("stdin", {}, "the key is empty"),
     ],
 )
@@ -434,3 +434,138 @@ def test_a_child_never_sees_keys_own_environment() -> None:
 
     env = {"PATH": "/bin", "HOME": "/h", "K": KEY, "OP_ACCOUNT": "acct", "GH_TOKEN": "x"}
     assert child_env(env, ("OP_",)) == {"PATH": "/bin", "HOME": "/h", "OP_ACCOUNT": "acct"}
+
+
+# ---------------------------------------------------------------------------- review fixes
+
+
+class _Redirect(http.server.BaseHTTPRequestHandler):
+    target = ""
+
+    def do_GET(self) -> None:
+        self.send_response(302)
+        self.send_header("Location", self.target)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, format: str, *args: Any) -> None:
+        pass
+
+
+class _Count(http.server.BaseHTTPRequestHandler):
+    seen: ClassVar[list[str]] = []
+
+    def do_GET(self) -> None:
+        _Count.seen.append(self.headers.get("Authorization", ""))
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, format: str, *args: Any) -> None:
+        pass
+
+
+def _serve(handler: type[http.server.BaseHTTPRequestHandler]) -> http.server.ThreadingHTTPServer:
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def test_a_redirect_is_not_followed_with_the_key(c: Canary) -> None:
+    other = _serve(_Count)
+    _Redirect.target = f"http://127.0.0.1:{other.server_address[1]}/elsewhere"
+    first = _serve(_Redirect)
+    _Count.seen.clear()
+    try:
+        result = c.run(
+            [
+                "check",
+                "http",
+                "--url",
+                f"http://127.0.0.1:{first.server_address[1]}/me",
+                "--bearer",
+                "--key",
+                "env:K",
+            ],
+            env={"K": KEY, "FPK": FP_KEY, "KEYS_FP_KEY": "env:FPK"},
+        )
+    finally:
+        first.shutdown()
+        other.shutdown()
+    assert _Count.seen == []
+    assert result.code == 2
+    assert "UNKNOWN (HTTP 302" in result.stdout
+
+
+def test_a_refused_connection_names_the_real_error_type(c: Canary) -> None:
+    result = c.run(
+        ["check", "http", "--url", "http://127.0.0.1:9/me", "--bearer", "--key", "env:K"],
+        env={"K": KEY, "FPK": FP_KEY, "KEYS_FP_KEY": "env:FPK"},
+    )
+    assert result.code == 2
+    assert "(ConnectionRefusedError)" in result.stdout
+
+
+@pytest.mark.parametrize("key", [KEY[:10] + "\n" + KEY[10:], KEY + "☃"])
+def test_a_key_that_cannot_go_in_a_header_is_unknown_not_a_crash(c: Canary, key: str) -> None:
+    c.watch(key)
+    result = c.run(
+        ["check", "http", "--url", "http://127.0.0.1:9/me", "--bearer", "--key", "env:K"],
+        env={"K": key, "FPK": FP_KEY, "KEYS_FP_KEY": "env:FPK"},
+    )
+    assert result.code == 2, result.stderr
+
+
+def test_an_env_source_named_like_a_token_is_not_echoed(c: Canary) -> None:
+    token = "gh" + "p_" + "Zx81Qw" * 6  # made up
+    c.watch(token)
+    result = c.run(
+        ["check", "github", "--key", f"env:{token}"],
+        env={"FPK": FP_KEY, "KEYS_FP_KEY": "env:FPK"},
+        send=Recorder(200),
+    )
+    assert result.code == 3
+    assert "the environment variable named by --key is not set" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "url", ["http://argilla.example.com", "file:///etc/hosts", "ftp://x.example.com"]
+)
+def test_argilla_and_every_provider_send_only_over_https(c: Canary, url: str) -> None:
+    code, out, s = check(c, ["argilla", "--url", url], 200)
+    assert code == 3
+    assert "https" in out
+    assert s.calls == []
+
+
+def test_userinfo_in_the_url_is_not_shown(c: Canary) -> None:
+    _code, out, _ = check(c, ["http", "--url", "https://someone@api.example.com/me", "--bearer"], 0)
+    assert "someone" not in out
+    assert "api.example.com/me" in out
+
+
+def test_a_short_fingerprint_key_is_refused(c: Canary) -> None:
+    result = c.run(
+        ["check", "github", "--key", "env:K"],
+        env={"K": KEY, "FPK": "short", "KEYS_FP_KEY": "env:FPK"},
+        send=Recorder(200),
+    )
+    assert result.code == 3
+    assert "at least 16" in result.stderr
+
+
+def test_no_hint_for_a_key_of_unknown_origin(c: Canary) -> None:
+    c.provider_issued = False
+    code, out, _ = check(c, ["http", "--url", "https://api.example.com/me", "--bearer"], 200)
+    assert code == 0
+    assert "…" not in out
+
+
+@pytest.mark.parametrize(
+    ("status", "verdict"), [("active", "WORKS"), ("disabled", "DEAD"), ("expired", "DEAD")]
+)
+def test_cloudflare_reads_the_token_status(c: Canary, status: str, verdict: str) -> None:
+    body = json.dumps({"success": True, "result": {"status": status}})
+    code, out, _ = check(c, ["cloudflare"], 200, body)
+    assert verdict in out
+    assert code == (0 if verdict == "WORKS" else 1)

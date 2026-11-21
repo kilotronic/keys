@@ -19,6 +19,7 @@ import base64
 import dataclasses
 import hashlib
 import hmac
+import http.client
 import ipaddress
 import json
 import re
@@ -65,16 +66,34 @@ class Options:
     dead_status: str | None = None
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect comes back as its own answer: following it would send the key's header on
+    to wherever Location points, plain http included."""
+
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
 def send(method: str, url: str, headers: dict[str, str], data: bytes | None = None) -> Answer:
-    req = urllib.request.Request(  # noqa: S310 - https, or http to this machine only
-        url, data=data, method=method, headers={"User-Agent": "keys-check", **headers}
-    )
+    handlers: list[urllib.request.BaseHandler] = [_NoRedirect()]
+    if _local(urllib.parse.urlsplit(url).hostname or ""):
+        handlers.append(urllib.request.ProxyHandler({}))  # this machine: never via a proxy
+    opener = urllib.request.build_opener(*handlers)
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
+        req = urllib.request.Request(  # noqa: S310 - https, or http to this machine only
+            url, data=data, method=method, headers={"User-Agent": "keys-check", **headers}
+        )
+        with opener.open(req, timeout=30) as resp:
             return Answer(resp.status, resp.read(4096).decode(errors="replace"))
     except urllib.error.HTTPError as e:
         return Answer(e.code, e.read(4096).decode(errors="replace"))
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
+    except urllib.error.URLError as e:
+        reason = e.reason
+        return Answer(
+            0, "", type(reason).__name__ if isinstance(reason, BaseException) else "URLError"
+        )
+    except (TimeoutError, OSError, http.client.HTTPException, ValueError) as e:
+        # Only the type: the text of some of these holds the URL or a header, so the key.
         return Answer(0, "", type(e).__name__)
 
 
@@ -114,6 +133,7 @@ class Provider:
     dead_codes: frozenset[str] = frozenset()
     needs: tuple[str, ...] = ()
     shown_url: str = ""  # what the result names; the real URL can hold the key (SerpApi)
+    hint: bool = True  # the provider issued the key, so its console shows this hint
 
 
 def _form(fields: dict[str, str]) -> bytes:
@@ -174,9 +194,6 @@ def _local(host: str) -> bool:
 def http_request(key: Secret, opts: Options) -> Request:
     if not opts.url:
         raise UsageError("http needs --url, and --header 'Name: {key}', --bearer or --query <name>")
-    parts = urllib.parse.urlsplit(opts.url)
-    if parts.scheme != "https" and not (parts.scheme == "http" and _local(parts.hostname or "")):
-        raise UsageError("http sends the key only over https (plain http only to this machine)")
     url = opts.url
     headers: dict[str, str] = {}
     if opts.bearer:
@@ -370,6 +387,7 @@ PROVIDERS: dict[str, Provider] = {
             http_request,
             {200},
             {401, 403},
+            hint=False,  # a key of unknown origin may be one we generated: no hint
         ),
     ]
 }
@@ -386,14 +404,18 @@ def check(provider: Provider, key: Secret, opts: Options, sender: Sender) -> tup
         if not getattr(opts, need, None):
             raise UsageError(f"{provider.name} needs --{need.replace('_', '-')}")
     method, url, headers, data = provider.build(key, opts)
+    target = urllib.parse.urlsplit(url)
+    if target.scheme != "https" and not (target.scheme == "http" and _local(target.hostname or "")):
+        raise UsageError("keys sends a key only over https (plain http only to this machine)")
     works, dead = provider.works, provider.dead
     if provider.name == "http":
         works = _statuses(opts.works_status, works)
         dead = _statuses(opts.dead_status, dead)
     answer = sender(method, url, headers, data)
     parts = urllib.parse.urlsplit(provider.shown_url or url)
-    where = _shown(f"{parts.netloc}{parts.path}", key) or parts.hostname or "the service"
-    where = _shown(where, key) or "the service"
+    host = parts.hostname or ""
+    port = f":{parts.port}" if parts.port else ""
+    where = _shown(f"{host}{port}{parts.path}", key) or _shown(host, key) or "the service"
     if answer.status == 0:
         kind = answer.error.split(":", 1)[0].strip()
         kind = kind if re.match(r"^[A-Za-z]{1,40}$", kind) else "network error"
@@ -405,6 +427,12 @@ def check(provider: Provider, key: Secret, opts: Options, sender: Sender) -> tup
     # know; only its (fixed, key-free) message tells them apart.
     if provider.name == "adobe" and "invalid client_id" in answer.body:
         return UNKNOWN, reason + ": Adobe does not know this client ID; check --client-id"
+    if provider.name == "cloudflare" and answer.status == 200:
+        # Cloudflare answers 200 for a disabled or expired token too; its status says which.
+        status = _cloudflare_status(answer.body)
+        if not status:
+            return UNKNOWN, f"{reason}: no token status in the answer"
+        return (WORKS, reason) if status == "active" else (DEAD, f"{reason} ({status})")
     if raw_code in provider.works_codes:
         return WORKS, reason
     if raw_code in provider.dead_codes:
@@ -414,3 +442,13 @@ def check(provider: Provider, key: Secret, opts: Options, sender: Sender) -> tup
     if answer.status in dead:
         return DEAD, reason
     return UNKNOWN, reason
+
+
+def _cloudflare_status(body: str) -> str:
+    try:
+        doc = cast(dict[str, Any], json.loads(body))
+        result = cast(dict[str, Any], doc.get("result") or {})
+        status = str(result.get("status") or "")
+    except (ValueError, AttributeError):
+        return ""
+    return status if re.fullmatch(r"[a-z_]{1,20}", status) else ""
