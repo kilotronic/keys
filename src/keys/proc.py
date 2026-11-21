@@ -5,7 +5,7 @@ and stdout coming back. A child's stderr is never kept, since it can repeat what
 from __future__ import annotations
 
 import subprocess
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 
 from keys.secret import Secret
@@ -31,10 +31,16 @@ KEEP = {
 }
 
 
-def child_env(environ: Mapping[str, str], prefixes: Sequence[str] = ()) -> dict[str, str]:
-    """The part of environ a child may see: the basics, and names with the given prefixes
-    (OP_ for op's own settings)."""
-    return {k: v for k, v in environ.items() if k in KEEP or any(k.startswith(p) for p in prefixes)}
+def child_env(
+    environ: Mapping[str, str], prefixes: Sequence[str] = (), names: Collection[str] = ()
+) -> dict[str, str]:
+    """The part of environ a child may see: the basics, names with the given prefixes (OP_ for
+    op's own settings), and the given names."""
+    return {
+        k: v
+        for k, v in environ.items()
+        if k in KEEP or k in names or any(k.startswith(p) for p in prefixes)
+    }
 
 
 class ChildError(Exception):
@@ -53,7 +59,9 @@ def run(
     *,
     stdin: Secret | str | None = None,
 ) -> Done:
-    data = stdin.reveal() if isinstance(stdin, Secret) else stdin
+    text = stdin.reveal() if isinstance(stdin, Secret) else stdin
+    # Bytes, not text: no newline translation, and UTF-8 whatever the locale says.
+    data = text.encode() if text is not None else None
     try:
         r = subprocess.run(
             list(argv),
@@ -61,7 +69,6 @@ def run(
             stdin=None if data is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            text=True,
             env=dict(environ),
             timeout=TIMEOUT_S,
             check=False,
@@ -72,4 +79,4 @@ def run(
         raise ChildError(f"{argv[0]} took longer than {TIMEOUT_S}s") from None
     except OSError as e:
         raise ChildError(f"{argv[0]} could not start ({type(e).__name__})") from None
-    return Done(r.returncode, r.stdout)
+    return Done(r.returncode, r.stdout.decode(errors="replace"))

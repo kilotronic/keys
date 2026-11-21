@@ -462,3 +462,51 @@ def test_child_stdin_is_refused_for_anything_but_a_write(canary: Canary, argv: l
 
     with pytest.raises(LeakError, match="stdin of"):
         canary.call(other)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["gh", "secret", "set", "S", "--repo", "o/r", "--debug"],
+        ["gcloud", "secrets", "versions", "add", "n", "--data-file=-", "--log-http"],
+        ["gcloud", "secrets", "versions", "add", "n", "--data-file=-", "--verbosity=debug"],
+        ["az", "keyvault", "secret", "set", "--name", "n", "--file", "/dev/stdin", "--verbose"],
+    ],
+)
+def test_a_write_with_a_debug_flag_is_refused_stdin(canary: Canary, argv: list[str]) -> None:
+    def write(ctx: Context) -> int:
+        subprocess.run(argv, input=canary.value, text=True, check=False, capture_output=True)
+        return 0
+
+    with pytest.raises(LeakError, match="stdin of"):
+        canary.call(write)
+
+
+def test_an_allowed_write_must_carry_exactly_one_expected_value(canary: Canary) -> None:
+    other = "another-watched-made-up-" + "w4" * 6
+    canary.watch(other)
+
+    def write(text: str) -> Step:
+        def step(ctx: Context) -> int:
+            argv = ["gh", "secret", "set", "S", "--repo", "o/r"]
+            subprocess.run(argv, input=text, text=True, check=False, capture_output=True)
+            return 0
+
+        return step
+
+    with pytest.raises(LeakError, match="stdin of gh"):
+        canary.call(write(canary.value + other))  # two values in one write
+    with pytest.raises(LeakError, match="stdin of gh"):
+        canary.call(write(other))  # a watched value that is not one 1Password holds
+    canary.op_value("op://V/i/credential", other)
+    assert canary.call(write(other)).children[0].target == "gh:o/r:S"
+
+
+def test_each_write_records_the_target_it_landed_on(canary: Canary) -> None:
+    def write(ctx: Context) -> int:
+        argv = ["az", "keyvault", "secret", "set", "--vault-name", "kv", "--name", "n"]
+        argv += ["--file", "/dev/stdin"]
+        subprocess.run(argv, input=canary.value, text=True, check=False, capture_output=True)
+        return 0
+
+    assert canary.call(write).children[0].target == "az:kv:n"

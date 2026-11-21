@@ -126,7 +126,9 @@ def test_the_org_secret_goes_to_its_repos_or_to_private_repos(c: Canary) -> None
     assert (org["visibility"], org["repos"]) == ("selected", "app,web")
     (c.work / "keys.toml").unlink()
     write_mapping(
-        c, '[[credential.target]]\ntype = "github-actions-org"\norg = "k2"\nsecret = "S"\n'
+        c,
+        '[[credential.target]]\ntype = "github-actions-org"\norg = "k2"\nsecret = "S"\n'
+        'visibility = "private"\n',
     )
     c.run(["sync", "app-mail"], env=ENV)
     org = c.target("gh:org:k2:S")
@@ -378,3 +380,219 @@ def test_a_railway_listing_keeps_names_only(c: Canary) -> None:
     )
     assert set(found) == {"V"}
     assert held not in repr(found)
+
+
+# ---------------------------------------------------------------------------- review fixes
+
+
+def test_a_value_ending_in_a_newline_is_stored_the_same_everywhere(c: Canary) -> None:
+    multi = "-----line one made up " + "m5" * 6 + "\nline two made up " + "n6" * 6 + "\n"
+    c.op_value(f"{ITEM}/credential", multi)
+    write_mapping(c)
+    result = c.run(["sync", "app-mail"], env=ENV)
+    assert result.code == 0, result.stderr
+    stored = multi.rstrip("\n")
+    fp = fingerprint(Secret(FP_KEY), Secret(stored))
+    for key in KEYS:
+        assert c.target(key)["value"] == stored, key  # type: ignore[index]
+    assert c.target("az:app-kv:mail-key")["tags"] == {"keys-fp": fp}  # type: ignore[index]
+    assert f"fp:{fp}" in result.stdout
+
+
+def test_a_value_holding_a_carriage_return_is_refused(c: Canary) -> None:
+    c.op_value(f"{ITEM}/credential", "made-up-value-with-cr-" + "r8" * 4 + "\r\n")
+    write_mapping(c)
+    result = c.run(["sync", "app-mail"], env=ENV)
+    assert result.code == 3
+    assert "carriage return" in result.stderr
+    assert not writes(c)
+
+
+def test_a_failure_after_railway_was_staged_names_the_staged_service(c: Canary) -> None:
+    write_mapping(c)
+    c.child_fails(["az", "keyvault", "secret", "set"], code=4)
+    result = c.run(["sync", "app-mail"], env=ENV)
+    assert result.code == 1
+    assert "staged but not redeployed: app (production)" in result.stderr
+
+
+def test_a_failed_redeploy_names_the_services_still_staged(c: Canary) -> None:
+    body = ALL_TARGETS + (
+        '\n[[credential.target]]\ntype = "railway"\nproject = "proj"\nservice = "web"\n'
+        'environment = "production"\nvariable = "MAIL_KEY"\n'
+    )
+    write_mapping(c, body)
+    c.child_fails(["railway", "redeploy"], code=2)
+    result = c.run(["sync", "app-mail"], env=ENV)
+    assert result.code == 1
+    assert "railway exited 2 redeploying" in result.stderr
+    assert "staged but not redeployed: app (production), web (production)" in result.stderr
+
+
+def test_a_gcp_label_failure_counts_as_written_and_says_so(c: Canary) -> None:
+    write_mapping(c)
+    c.child_fails(["gcloud", "secrets", "update"], code=7)
+    result = c.run(["sync", "app-mail"], env=ENV)
+    assert result.code == 1
+    assert c.target("gcp:app-prod:mail-key")["value"] == CANARY  # type: ignore[index]
+    assert "value written, fingerprint label not updated" in result.stdout
+    assert "keys sync: 6 targets written" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "words",
+    [
+        ["gh", "secret", "set"],
+        ["az", "keyvault", "secret", "set"],
+        ["gcloud", "secrets", "versions"],
+    ],
+)
+def test_each_cli_s_write_failure_shows_only_its_exit_code(c: Canary, words: list[str]) -> None:
+    write_mapping(c)
+    c.child_fails(words, code=9)  # its error text holds the canary
+    result = c.run(["sync", "app-mail"], env=ENV)
+    assert result.code == 1
+    assert f"{words[0]} exited 9" in result.stderr
+
+
+def test_debug_and_log_variables_never_reach_a_child(c: Canary) -> None:
+    write_mapping(c)
+    noisy = {
+        "GH_DEBUG": "api",
+        "GH_TOKEN": "gh-token-made-up",
+        "CLOUDSDK_CORE_LOG_HTTP": "true",
+        "CLOUDSDK_CORE_VERBOSITY": "debug",
+        "AZURE_CORE_COLLECT_TELEMETRY": "true",
+        "AZURE_CONFIG_DIR": "/nowhere",
+        "RAILWAY_TOKEN": "railway-token-made-up",
+        "RAILWAY_DEBUG": "1",
+    }
+    result = c.run(["sync", "app-mail"], env={**ENV, **noisy})
+    assert result.code == 0, result.stderr
+    seen = {name for ch in c.children() for name in ch.env}
+    for name in ("GH_DEBUG", "CLOUDSDK_CORE_LOG_HTTP", "CLOUDSDK_CORE_VERBOSITY"):
+        assert name not in seen
+    assert "AZURE_CORE_COLLECT_TELEMETRY" not in seen
+    assert "RAILWAY_DEBUG" not in seen
+    gh = next(ch for ch in c.children() if ch.prog == "gh")
+    assert "GH_TOKEN" in gh.env
+    assert "RAILWAY_TOKEN" not in gh.env
+
+
+def test_the_fingerprint_key_s_variable_never_reaches_a_child(c: Canary) -> None:
+    write_mapping(c)
+    # GH_TOKEN would be passed to gh; holding the fingerprint key, it must not be.
+    result = c.run(["sync", "app-mail"], env={"GH_TOKEN": FP_KEY, "KEYS_FP_KEY": "env:GH_TOKEN"})
+    assert result.code == 0, result.stderr
+
+
+def test_an_org_secret_without_repos_needs_its_visibility(c: Canary) -> None:
+    body = '[[credential.target]]\ntype = "github-actions-org"\norg = "k2"\nsecret = "S"\n'
+    write_mapping(c, body)
+    result = c.run(["sync", "app-mail"], env=ENV)
+    assert result.code == 3
+    assert "visibility" in result.stderr
+    assert not c.children()
+    (c.work / "keys.toml").unlink()
+    write_mapping(c, body + 'visibility = "all"\n')
+    result = c.run(["sync", "app-mail"], env=ENV)
+    assert result.code == 0, result.stderr
+    assert c.target("gh:org:k2:S")["visibility"] == "all"  # type: ignore[index]
+
+
+def test_a_key_vault_name_with_an_underscore_is_refused_up_front(c: Canary) -> None:
+    write_mapping(
+        c, '[[credential.target]]\ntype = "azure-key-vault"\nvault = "kv"\nsecret = "a_b"\n'
+    )
+    result = c.run(["sync", "app-mail"], env=ENV)
+    assert result.code == 3
+    assert not c.children()
+
+
+def test_gcloud_runs_quietly(c: Canary) -> None:
+    write_mapping(c)
+    c.run(["sync", "app-mail"], env=ENV)
+    gcloud = [ch.argv for ch in c.children() if ch.prog == "gcloud"]
+    assert gcloud
+    assert all("--quiet" in argv for argv in gcloud)
+
+
+def test_a_credential_with_no_recorded_fingerprint_says_it_was_not_compared(c: Canary) -> None:
+    write_mapping(c)
+    result = c.run(["sync", "app-mail"], env=ENV)
+    assert "app-mail: the mapping file records no fingerprint" in result.stdout
+
+
+def test_the_force_message_names_the_line_to_record(c: Canary) -> None:
+    write_mapping(c, fp="0badf00d")
+    result = c.run(["sync", "app-mail", "--force"], env=ENV)
+    assert f'fp = "{FP}"' in result.stdout
+
+
+def test_all_with_force_and_one_mismatch_writes_both(c: Canary) -> None:
+    write_mapping(
+        c,
+        '[[credential.target]]\ntype = "github-actions"\nrepo = "o/a"\nsecret = "A"\n',
+        fp="0badf00d",
+    )
+    other = "op://Automation/generic second"
+    second = "second-value-made-up-" + "x7" * 6
+    c.op_value(f"{other}/credential", second)
+    path = c.work / "keys.toml"
+    path.write_text(
+        path.read_text()
+        + f'\n[[credential]]\nname = "second"\nkind = "generic"\nitem = "{other}"\n'
+        + 'kept_because = "x"\n[[credential.target]]\ntype = "github-actions"\n'
+        + 'repo = "o/b"\nsecret = "B"\n'
+    )
+    assert c.run(["sync", "--all"], env=ENV).code == 1
+    assert not writes(c)
+    result = c.run(["sync", "--all", "--force"], env=ENV)
+    assert result.code == 0, result.stderr
+    assert c.target("gh:o/a:A")["value"] == CANARY  # type: ignore[index]
+    assert c.target("gh:o/b:B")["value"] == second  # type: ignore[index]
+
+
+def test_each_write_lands_on_its_own_target(c: Canary) -> None:
+    write_mapping(c)
+    c.run(["sync", "app-mail"], env=ENV)
+    landed = sorted(ch.target for ch in c.children() if ch.target)
+    assert landed == sorted(KEYS)
+
+
+def _no_wait(_seconds: float) -> None:
+    return None
+
+
+RAILWAY_ONLY = (
+    '[[credential.target]]\ntype = "railway"\nservice = "app"\nenvironment = "production"\n'
+    'variable = "K"\n'
+)
+
+
+def test_the_redeploy_waits_for_a_deployment_in_flight(
+    c: Canary, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_mapping(c, RAILWAY_ONLY)
+    c.set_db(
+        "deploys",
+        {"deploys:railway::app:production:": [{"id": "d0", "status": "BUILDING", "polls": 2}]},
+    )
+    slept: list[float] = []
+    result = c.run(["sync", "app-mail"], env=ENV, sleep=slept.append)
+    assert result.code == 0, result.stderr
+    assert slept
+    assert "app (production): deployed" in result.stdout
+
+
+def test_a_deployment_that_never_finishes_fails_the_sync(
+    c: Canary, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from keys import targets as t
+
+    monkeypatch.setattr(t, "DEPLOY_ATTEMPTS", 3)
+    write_mapping(c, RAILWAY_ONLY)
+    c.set_db("deploy_status", "BUILDING")
+    result = c.run(["sync", "app-mail"], env=ENV, sleep=_no_wait)
+    assert result.code == 1
+    assert "did not finish" in result.stderr

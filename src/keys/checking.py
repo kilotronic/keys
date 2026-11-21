@@ -67,6 +67,12 @@ def read_key(source: str, ctx: Context, what: str = "key") -> Secret:
     return Secret(text)
 
 
+def fp_key_variable(flag: str | None, ctx: Context) -> str | None:
+    """The environment variable the fingerprint key comes from, if it comes from one."""
+    source = flag or ctx.environ.get("KEYS_FP_KEY") or ""
+    return source[4:] if source.startswith("env:") else None
+
+
 def read_fp_key(flag: str | None, ctx: Context) -> Secret:
     """The fingerprint secret, from --fp-key or $KEYS_FP_KEY (op://…, env:NAME or stdin)."""
     source = flag or ctx.environ.get("KEYS_FP_KEY")

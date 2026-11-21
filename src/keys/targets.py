@@ -19,18 +19,37 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
-from keys import mapping, proc
+from keys import looks, mapping, proc
 from keys.context import UsageError
 from keys.secret import Secret
 
 FP_TAG = "keys-fp"  # the Key Vault tag and Secret Manager label holding the keyed fingerprint
 
-# Each CLI sees only the basics of keys's environment and its own settings.
-PREFIXES: dict[str, tuple[str, ...]] = {
-    "gh": ("GH_", "GITHUB_"),
-    "railway": ("RAILWAY_",),
-    "az": ("AZURE_",),
-    "gcloud": ("CLOUDSDK_", "GOOGLE_"),
+# Each CLI sees only the basics of keys's environment and the few of its own variables that
+# sign it in or find its settings; never its debug, logging or telemetry switches, which can
+# print what it sends.
+ENV_NAMES: dict[str, frozenset[str]] = {
+    "gh": frozenset(
+        {
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+            "GH_HOST",
+            "GH_CONFIG_DIR",
+        }
+    ),
+    "railway": frozenset({"RAILWAY_TOKEN", "RAILWAY_API_TOKEN"}),
+    "az": frozenset({"AZURE_CONFIG_DIR"}),
+    "gcloud": frozenset(
+        {
+            "CLOUDSDK_CONFIG",
+            "CLOUDSDK_ACTIVE_CONFIG_NAME",
+            "CLOUDSDK_CORE_ACCOUNT",
+            "CLOUDSDK_PYTHON",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+        }
+    ),
 }
 
 _PLAIN = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}"
@@ -44,11 +63,15 @@ FIELD_RULES: dict[str, re.Pattern[str]] = {
     "service": re.compile(_PLAIN),
     "project": re.compile(_PLAIN),
     "vault": re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{1,62}"),
+    "visibility": re.compile(r"selected|all|private"),
+}
+# Where a target type is stricter than the field's general rule.
+TYPE_RULES: dict[tuple[str, str], re.Pattern[str]] = {
+    ("azure-key-vault", "secret"): re.compile(r"[A-Za-z0-9-]{1,127}"),
 }
 # Fields shown in output. A Railway project is often a UUID, which is shaped like a Railway
 # token, so it is checked but never printed.
 NOT_SHOWN = {"project"}
-_RUN = re.compile(r"[^\s/]{24,}")
 
 IN_PROGRESS = {"INITIALIZING", "QUEUED", "WAITING", "BUILDING", "DEPLOYING"}
 SUCCEEDED = {"SUCCESS", "SLEEPING"}  # a sleeping deployment succeeded and then idled
@@ -60,6 +83,23 @@ class TargetError(Exception):
     """A target's CLI failed; names the program, the step and the exit code only."""
 
 
+class PartialWrite(TargetError):
+    """The value was written, but something after it (a fingerprint label) was not."""
+
+
+def normalise(value: Secret, name: str) -> Secret:
+    """The one form every target stores. gh trims trailing line breaks and az folds CR LF, so
+    a value holding a carriage return is refused, and trailing line breaks are removed for every
+    target alike: then each stores the same bytes, and the fingerprint names what they hold."""
+    text = value.reveal()
+    if "\r" in text:
+        raise UsageError(
+            f"{name}: its 1Password value holds a carriage return, which targets store "
+            "differently; nothing was written"
+        )
+    return Secret(text.rstrip("\n"))
+
+
 @dataclass(frozen=True)
 class Present:
     """One secret at a target's scope, as its metadata shows it. Never a value."""
@@ -69,23 +109,24 @@ class Present:
     fp: str = ""  # the keyed fingerprint tag or label keys wrote, when there is one
 
 
-def looks_shaped(text: str) -> bool:
-    """A long run of letters and digits together, as keys are."""
-    return any(
-        any(ch.isalpha() for ch in run) and any(ch.isdigit() for ch in run)
-        for run in _RUN.findall(text)
-    )
-
-
 def check_fields(where: str, t: mapping.Target) -> None:
     """Every field of t is a plain name. Raises naming the field, never its content."""
     for key, value in t.fields.items():
-        rule = FIELD_RULES.get(key)
+        rule = TYPE_RULES.get((t.type, key)) or FIELD_RULES.get(key)
         items = value if isinstance(value, list) else [value]
         for item in items:
             ok = rule is not None and rule.fullmatch(item) is not None
-            if not ok or (key not in NOT_SHOWN and looks_shaped(item)):
+            if not ok or (key not in NOT_SHOWN and looks.looks_like_value(item)):
                 raise UsageError(f"{where}.{key}: not a plain name keys will pass to a program")
+    if t.type == "github-actions-org":
+        visibility = t.fields.get("visibility")
+        if t.fields.get("repos") and visibility not in (None, "selected"):
+            raise UsageError(f"{where}.visibility: with repos, it can only be selected")
+        if not t.fields.get("repos") and visibility not in ("all", "private"):
+            raise UsageError(
+                f"{where}.visibility: without repos, say all or private, so a sync never "
+                "changes which repos can read the secret"
+            )
 
 
 class Adapter:
@@ -124,7 +165,7 @@ class Adapter:
         raise NotImplementedError
 
     def _run(self, what: str, argv: list[str], stdin: Secret | None = None) -> str:
-        env = proc.child_env(self.environ, PREFIXES.get(argv[0], ()))
+        env = proc.child_env(self.environ, names=ENV_NAMES.get(argv[0], frozenset()))
         try:
             done = proc.run(argv, env, stdin=stdin)
         except proc.ChildError as e:
@@ -201,14 +242,10 @@ class GitHubOrg(_GitHub):
 
     def write(self, value: Secret, fp: str) -> None:
         repos = self.f("repos")
-        visibility = (
-            ["--visibility", "selected", "--repos", repos]
-            if repos
-            else [
-                "--visibility",
-                "private",
-            ]
-        )
+        if repos:
+            visibility = ["--visibility", "selected", "--repos", repos]
+        else:
+            visibility = ["--visibility", self.f("visibility")]
         argv = ["gh", "secret", "set", self.name, *self._scope_flags(), *visibility]
         self._run("setting the secret", argv, value)
 
@@ -312,7 +349,7 @@ class GcpSecret(Adapter):
         return f"gcp-secret {self.f('project')} {self.name}"
 
     def write(self, value: Secret, fp: str) -> None:
-        project = ["--project", self.f("project")]
+        project = ["--project", self.f("project"), "--quiet"]
         label = f"{FP_TAG}={fp}"
         if self.name not in self.listing():
             argv = ["gcloud", "secrets", "create", self.name, *project]
@@ -322,10 +359,14 @@ class GcpSecret(Adapter):
         argv = ["gcloud", "secrets", "versions", "add", self.name, *project, "--data-file=-"]
         self._run("adding a version", argv, value)
         argv = ["gcloud", "secrets", "update", self.name, *project, "--update-labels", label]
-        self._run("labelling the secret", argv)
+        try:
+            self._run("labelling the secret", argv)
+        except TargetError as e:
+            raise PartialWrite(f"value written, fingerprint label not updated ({e})") from None
 
     def listing(self) -> dict[str, Present]:
-        argv = ["gcloud", "secrets", "list", "--project", self.f("project"), "--format", "json"]
+        argv = ["gcloud", "secrets", "list", "--project", self.f("project"), "--quiet"]
+        argv += ["--format", "json"]
         rows = self._json("listing secrets", self._run("listing secrets", argv))
         out: dict[str, Present] = {}
         for row in cast(list[Any], rows if isinstance(rows, list) else []):
@@ -334,7 +375,8 @@ class GcpSecret(Adapter):
             r = cast(dict[str, Any], row)
             name = str(r.get("name", "")).rsplit("/", 1)[-1]
             labels = cast(dict[str, Any], r.get("labels") or {})
-            out[name] = Present(name, str(r.get("createTime") or ""), _fp(labels.get(FP_TAG)))
+            # The secret's createTime is not its newest version's, so no date is claimed.
+            out[name] = Present(name, "", _fp(labels.get(FP_TAG)))
         return out
 
 

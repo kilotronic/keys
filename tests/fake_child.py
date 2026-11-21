@@ -69,7 +69,8 @@ def _read_stdin(wait: float) -> str:
     if sys.stdin.isatty():
         return ""
     ready, _, _ = select.select([sys.stdin], [], [], wait)
-    return sys.stdin.read() if ready else ""
+    # Bytes, decoded as UTF-8: what keys sent, with no newline translation or locale.
+    return sys.stdin.buffer.read().decode("utf-8", errors="replace") if ready else ""
 
 
 def words_and_flags(argv: list[str]) -> tuple[list[str], dict[str, str | bool]]:
@@ -96,7 +97,8 @@ def words_and_flags(argv: list[str]) -> tuple[list[str], dict[str, str | bool]]:
 
 def main(prog: str, argv: list[str]) -> int:
     me = uuid.uuid4().hex
-    _log({"id": me, "prog": prog, "argv": [prog, *argv]})
+    os.environ["KEYS_FAKE_ID"] = me
+    _log({"id": me, "prog": prog, "argv": [prog, *argv], "env": sorted(os.environ)})
     words, flags = words_and_flags(argv)
     stdin = ""
     if prog != "op" or "-" in words:
@@ -191,6 +193,7 @@ def _labels(text: str) -> dict[str, str]:
 
 
 def _put(db: dict[str, Any], key: str, value: str, **meta: Any) -> None:
+    _log({"id": os.environ.get("KEYS_FAKE_ID", ""), "target": key})
     store: dict[str, Any] = db.setdefault("targets", {})
     db["clock"] = int(db.get("clock", 0)) + 1
     entry = store.setdefault(key, {})
@@ -213,7 +216,8 @@ def targets(
     w = [prog, *words]
     if w[:3] == ["gh", "secret", "set"] and len(w) == 4:
         meta = {"visibility": _flag(flags, "--visibility"), "repos": _flag(flags, "--repos")}
-        _put(db, target_key("gh", flags, w[3]), stdin, **meta)
+        # gh trims a value read from stdin of its trailing line breaks.
+        _put(db, target_key("gh", flags, w[3]), stdin.rstrip("\r\n"), **meta)
         return 0
     if w[:3] == ["gh", "secret", "list"]:
         prefix = target_key("gh", flags, "")
@@ -229,9 +233,15 @@ def targets(
         return 0
     if w[:3] == ["railway", "deployment", "list"]:
         key = "deploys:" + target_key("railway", flags, "")
-        print(
-            json.dumps(db.setdefault("deploys", {}).get(key, [{"id": "d0", "status": "SUCCESS"}]))
-        )
+        first = [{"id": "d0", "status": "SUCCESS"}]
+        history = db.setdefault("deploys", {}).setdefault(key, first)
+        for d in history:  # a deployment in flight finishes after its number of looks
+            if "polls" in d:
+                d["polls"] -= 1
+                if d["polls"] <= 0:
+                    d["status"] = "SUCCESS"
+                    del d["polls"]
+        print(json.dumps(history))
         return 0
     if w[:2] == ["railway", "redeploy"]:
         key = "deploys:" + target_key("railway", flags, "")
@@ -241,7 +251,9 @@ def targets(
         return 0
     if w[:4] == ["az", "keyvault", "secret", "set"] and _flag(flags, "--file") == "/dev/stdin":
         name = _flag(flags, "--name")
-        _put(db, target_key("az", flags, name), stdin, tags=_labels(_flag(flags, "--tags")))
+        # az reads the file in text mode, which folds a CR LF into LF.
+        value = stdin.replace("\r\n", "\n")
+        _put(db, target_key("az", flags, name), value, tags=_labels(_flag(flags, "--tags")))
         return 0
     if w[:4] == ["az", "keyvault", "secret", "list"]:
         vault = _flag(flags, "--vault-name")

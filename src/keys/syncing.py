@@ -16,7 +16,7 @@ from __future__ import annotations
 import argparse
 
 from keys import listing, mapping, targets
-from keys.checking import read_fp_key
+from keys.checking import fp_key_variable, read_fp_key
 from keys.context import EXIT_FAIL, EXIT_OK, Context, UsageError
 from keys.fingerprint import fingerprint
 from keys.op import Op, OpError
@@ -63,12 +63,15 @@ def _plural(n: int) -> str:
 def run(args: argparse.Namespace, ctx: Context) -> int:
     m = listing.load(args, ctx)
     creds = chosen(args, m)
-    plan = [(c, targets.adapters(c, ctx.environ)) for c in creds]  # every field checked first
+    # The variable holding the fingerprint key reaches no child, whatever its name.
+    hidden = fp_key_variable(args.fp_key, ctx)
+    environ = {k: v for k, v in ctx.environ.items() if k != hidden}
+    plan = [(c, targets.adapters(c, environ)) for c in creds]  # every field checked first
     if args.dry_run:
         return _dry_run(plan, ctx)
 
     fp_key = read_fp_key(args.fp_key, ctx)
-    op = Op(ctx.environ)
+    op = Op(environ)
     values: list[tuple[mapping.Credential, list[targets.Adapter], Secret, str]] = []
     for c, ads in plan:
         if not ads:
@@ -80,28 +83,49 @@ def run(args: argparse.Namespace, ctx: Context) -> int:
             raise UsageError(f"could not read {c.name} from 1Password: {e}") from None
         if not value.reveal().strip():
             raise UsageError(f"{c.name}: its 1Password value is empty; paste it there first")
+        value = targets.normalise(value, c.name)
         values.append((c, ads, value, fingerprint(fp_key, value)))
 
+    for c, _, _, _ in values:
+        if not c.fp:
+            ctx.say(
+                f"note: {c.name}: the mapping file records no fingerprint, so 1Password's value "
+                "was not compared with it"
+            )
     differs = [(c, fp) for c, _, _, fp in values if c.fp and c.fp != fp]
     for c, fp in differs:
         line = f"{c.name}: 1Password's value is fp:{fp}, but the mapping file records fp:{c.fp}"
         if not args.force:
             ctx.warn(f"keys: {line}; nothing was written. Rerun with --force to write it anyway")
         else:
-            ctx.say(f"note: {line}; written anyway (--force): record it or fix the mapping file")
+            ctx.say(
+                f'note: {line}; written anyway (--force): if it is right, record fp = "{fp}" '
+                f"for {c.name} in the mapping file"
+            )
     if differs and not args.force:
         return EXIT_FAIL
 
     written = 0
+    partial = False
     railway: dict[tuple[str, ...], targets.Railway] = {}
+
+    def staged(rs: list[targets.Railway]) -> str:
+        names = ", ".join(r.service_label() for r in rs)
+        return f"; staged but not redeployed: {names}" if rs else ""
+
     for c, ads, value, fp in values:
         for a in ads:
             try:
                 a.write(value, fp)
+            except targets.PartialWrite as e:
+                written += 1
+                partial = True
+                ctx.say(f"{c.name}  {a.describe()}  fp:{fp}  {e}")
+                continue
             except targets.TargetError as e:
                 ctx.warn(
                     f"keys: {c.name}: stopped at {a.describe()}: {e}; "
-                    f"{_plural(written)} written before it"
+                    f"{_plural(written)} written before it{staged(list(railway.values()))}"
                 )
                 return EXIT_FAIL
             written += 1
@@ -109,20 +133,24 @@ def run(args: argparse.Namespace, ctx: Context) -> int:
             if isinstance(a, targets.Railway):
                 railway.setdefault(a.scope(), a)
 
-    for r in railway.values():
+    services = list(railway.values())
+    for i, r in enumerate(services):
         if args.no_deploy:
             ctx.say(f"{r.service_label()}: staged, not redeployed (--no-deploy)")
             continue
         try:
             r.redeploy(ctx.sleep)
         except targets.TargetError as e:
-            ctx.warn(f"keys: {e}; its variables are staged, and the old deployment still runs")
+            ctx.warn(
+                f"keys: {e}; the old deployment still runs{staged(services[i:])}; "
+                f"{_plural(written)} written"
+            )
             return EXIT_FAIL
         ctx.say(f"{r.service_label()}: deployed")
     noun = "target" if written == 1 else "targets"
     creds = "credential" if len(values) == 1 else "credentials"
     ctx.say(f"keys sync: {written} {noun} written for {len(values)} {creds}")
-    return EXIT_OK
+    return EXIT_FAIL if partial else EXIT_OK
 
 
 def _dry_run(plan: list[tuple[mapping.Credential, list[targets.Adapter]]], ctx: Context) -> int:

@@ -61,7 +61,7 @@ CREDENTIAL_FIELDS = {
 TARGETS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "github-actions": (("repo", "secret"), ()),
     "github-actions-env": (("repo", "environment", "secret"), ()),
-    "github-actions-org": (("org", "secret"), ("repos",)),
+    "github-actions-org": (("org", "secret"), ("repos", "visibility")),
     "railway": (("service", "environment", "variable"), ("project",)),
     "azure-key-vault": (("vault", "secret"), ()),
     "gcp-secret": (("project", "secret"), ()),

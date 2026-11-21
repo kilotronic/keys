@@ -149,20 +149,27 @@ Writes the value in 1Password to every target the mapping file lists for that cr
 value is read in process and handed to each target's own command line on its stdin, never its
 arguments, a file or the terminal:
 
-| Target               | Command                                                                     |
-| -------------------- | --------------------------------------------------------------------------- |
-| `github-actions`     | `gh secret set NAME --repo R`                                               |
-| `github-actions-env` | `gh secret set NAME --repo R --env E`                                       |
-| `github-actions-org` | `gh secret set NAME --org O --visibility selected --repos a,b` (or private) |
-| `railway`            | `railway variable set KEY --stdin --skip-deploys --service S ...`           |
-| `azure-key-vault`    | `az keyvault secret set --file /dev/stdin --tags keys-fp=<fp>`              |
-| `gcp-secret`         | `gcloud secrets versions add NAME --data-file=-`, then a `keys-fp` label    |
+| Target               | Command                                                                          |
+| -------------------- | -------------------------------------------------------------------------------- |
+| `github-actions`     | `gh secret set NAME --repo R`                                                    |
+| `github-actions-env` | `gh secret set NAME --repo R --env E`                                            |
+| `github-actions-org` | `gh secret set NAME --org O --visibility selected --repos a,b` (or all, private) |
+| `railway`            | `railway variable set KEY --stdin --skip-deploys --service S ...`                |
+| `azure-key-vault`    | `az keyvault secret set --file /dev/stdin --tags keys-fp=<fp>`                   |
+| `gcp-secret`         | `gcloud secrets versions add NAME --data-file=-`, then a `keys-fp` label         |
 
 Railway variables are staged without a deploy; then each Railway service is redeployed once and
 waited for, told apart from the old deployment by its id (`--no-deploy` skips that). Key Vault
 and Secret Manager get the keyed fingerprint as a tag or label, so a later check can compare it
-without the value. Each program sees only the basic variables of keys's environment and its own
-(`GH_`/`GITHUB_`, `RAILWAY_`, `AZURE_`, `CLOUDSDK_`/`GOOGLE_`).
+without the value. Each program sees only the basic variables of keys's environment and the few
+of its own that sign it in or find its settings (`GH_TOKEN`, `GITHUB_TOKEN`, `GH_HOST`,
+`GH_CONFIG_DIR`, `RAILWAY_TOKEN`, `RAILWAY_API_TOKEN`, `AZURE_CONFIG_DIR`, `CLOUDSDK_CONFIG`,
+`GOOGLE_APPLICATION_CREDENTIALS` and a few more), never a debug, logging or telemetry switch,
+and never the variable the fingerprint key came from.
+
+Every target stores the same bytes: `gh` trims a value's trailing line breaks and `az` folds
+CR LF, so keys refuses a value holding a carriage return and removes trailing line breaks
+before any write, for every target alike. The fingerprint is of what the targets hold.
 
 ```text
 $ keys sync app-mail
@@ -183,6 +190,14 @@ keys sync: 2 targets written for 1 credential
 - `--dry-run` reads nothing from 1Password and writes nothing: it names each target, whether
   the secret is there yet, and fails if a target cannot be listed.
 - It needs the fingerprint key (`--fp-key` or `$KEYS_FP_KEY`), as `keys check` does.
+- An organisation secret with `repos` is shared with those repos only; one without must say
+  `visibility = "all"` or `"private"`, so a sync never widens or narrows who can read it.
+- In Secret Manager, if the new version is added but its fingerprint label is not, the line
+  says so and the sync exits 1: the value is in place, the label is stale.
+- Built against the help of `railway` 5.71.0 (`variable set --stdin --skip-deploys`). Not yet
+  proven against a real project: that a redeploy picks up variables staged with
+  `--skip-deploys`, and that `railway deployment list --json` lists the newest first.
+
 ## Does this text look like a value?
 
 One module, `keys.looks`, answers it for every place keys might repeat text. Text looks like a
@@ -198,6 +213,9 @@ Where the places differ, and why:
 - **Field names** in a mapping error are named only when they are a near miss of a real field
   (a typo) and pass the rule whole. A `verify` key that mixes letters and digits for 24
   characters, such as `header_x_api_key_v2_2024abc`, is refused.
+- **Target fields** in the mapping file (repos, secret names, services) go on a program's
+  command line, so each must match its field's plain-name rule and pass the rule; a Railway
+  project, often a UUID, is checked against its name rule but never printed.
 - **Error codes** from a service are shown only when they are 60 plain characters or fewer and
   pass the rule.
 - **File names** in a scan finding are split on `-`, `_` and `.`, and the long-run rule applies
@@ -219,7 +237,8 @@ a fake 1Password and fake services, runs the command, and fails if the value rea
   any program that is not one of the harness's fakes on `PATH` fails the test. Piping the value
   to a child is allowed only for `op item create` and `op item edit`, and for each target's
   write command (`gh secret set`, `railway variable set`, `az keyvault secret set`,
-  `gcloud secrets versions add`, `gcloud secrets create`);
+  `gcloud secrets versions add`, `gcloud secrets create`), never with a debug or logging flag,
+  and then only exactly one value 1Password holds, recording which target it landed on;
 - any file: a write under the temp folder, or outside the temporary home and working folder,
   fails at once; after the run no file there may hold the value unless the test planted it and
   it is unchanged;

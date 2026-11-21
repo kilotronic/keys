@@ -72,9 +72,18 @@ STDIN_OK = (
 )
 
 
+# A write that would print what it sends (debug, verbose or HTTP logging) is never allowed one.
+NOISY_FLAGS = ("--debug", "--verbose", "--verbosity", "--log-http", "--trace")
+
+
 def stdin_ok(argv: Sequence[str]) -> bool:
+    if any(a.split("=", 1)[0] in NOISY_FLAGS for a in argv):
+        return False
     words = tuple(a for a in argv if not a.startswith("-"))
     return any(words[: len(ok)] == ok for ok in STDIN_OK)
+
+
+ITEM_WRITES = STDIN_OK[:2]  # op item create and edit take item JSON, checked like any channel
 
 
 class LeakError(AssertionError):
@@ -165,6 +174,8 @@ class Child:
     prog: str
     argv: list[str]
     stdin: str
+    env: list[str] = field(default_factory=lambda: list[str]())  # names only
+    target: str = ""  # the fake target a write landed on (see fake_child.target_key)
 
 
 @dataclass
@@ -343,7 +354,9 @@ class Canary:
         for line in self.log_path.read_text().splitlines():
             row = json.loads(line)
             if "argv" in row:
-                started[row["id"]] = Child(row["prog"], row["argv"], "")
+                started[row["id"]] = Child(row["prog"], row["argv"], "", row.get("env", []))
+            elif row["id"] in started and "target" in row:
+                started[row["id"]].target = row["target"]
             elif row["id"] in started:
                 started[row["id"]].stdin = row["stdin"]
         return list(started.values())
@@ -498,6 +511,14 @@ class Canary:
 
     # ------------------------------------------------------------------ checking
 
+    def _expected_write(self, data: str) -> bool:
+        """A target write carries exactly one value 1Password holds (the canary or an
+        op_value), as read or with its trailing line breaks removed (keys's one change)."""
+        for v in [self.value, *self.db.get("values", {}).values()]:
+            if v and data in (v, v.rstrip("\n")):
+                return True
+        return False
+
     def secrets(self) -> list[str]:
         return [self.value, *self.extra_values]
 
@@ -512,8 +533,12 @@ class Canary:
         if escaped is not None:
             channels.append(("exception", escaped.encode()))
         for c in result.children:
-            if not stdin_ok(c.argv):
-                channels.append((f"stdin of {c.prog}", c.stdin.encode()))
+            words = tuple(a for a in c.argv if not a.startswith("-"))
+            if not stdin_ok(c.argv) or any(words[: len(w)] == w for w in ITEM_WRITES):
+                if not stdin_ok(c.argv):
+                    channels.append((f"stdin of {c.prog}", c.stdin.encode()))
+            elif c.stdin and not self._expected_write(c.stdin):
+                raise LeakError(f"the stdin of {c.prog} is not exactly one value 1Password holds")
             channels.append((f"argv of {c.prog}", "\0".join(c.argv).encode()))
         for e in events:
             if e["event"] == "spawn":
