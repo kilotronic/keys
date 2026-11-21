@@ -143,6 +143,14 @@ next: paste the value into its credential field in the 1Password app (never a te
 
 Kinds: `github-app-key`, `github-pat`, `railway-project-token`, `cloudflare-token`, `generic`.
 
+## Does this text look like a value?
+
+One module, `keys.looks`, answers it for every place keys might repeat text: a field name in a
+mapping error, the flags `keys new` writes to the mapping file, a file name in a scan finding,
+and a service's error code in `keys check`. Text looks like a value when it holds a control or
+unprintable character, a secret shape, a UUID, or a run of 24 or more characters with no space
+that mixes letters and digits (outside a plain link). Each place adds only what it alone knows.
+
 ## The canary tests
 
 Every command's tests run through one harness, `tests/canary.py`. It plants a made-up value in
@@ -185,9 +193,6 @@ Phase 2, from the design:
   `twilio-key`, `azure-app-secret`, and `generated` (a random signing secret, with `mint`).
 - Probes for Railway, Resend and Twilio, and the old checker's Key Vault and gitleaks-report
   sources, so the old scripts can become thin shims and then be deleted.
-- One shared "does this text look like a value?" test. Today the same question is answered
-  in four places (unknown mapping keys, `keys new`'s flag checks, scan's file names and
-  patterns, and check's error-code filter), each a little differently.
 - The schedules: the nightly CI run with an issue from day 120, and a daily launchd `keys scan`
   on the Mac.
 - A check, once, that `op item create` keeps the empty non-secret fields `keys new` asks for

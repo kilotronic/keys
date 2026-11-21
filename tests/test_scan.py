@@ -246,7 +246,9 @@ def test_a_control_character_in_a_file_name_cannot_forge_a_line(c: Canary) -> No
     c.plant(".claude/a\nb.txt", f"{CANARY}\n")
     code, out, _ = scan(c)
     assert code == 1
-    assert "~/.claude/a\\nb.txt:1: app-mail (known value)" in out
+    # A control character makes the name look like a value: it is withheld, so it forges nothing.
+    assert "~/.claude/<name withheld>:1: app-mail (known value)" in out
+    assert "\nb.txt" not in out
 
 
 def test_a_symlinked_root_is_followed(c: Canary) -> None:

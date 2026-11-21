@@ -17,11 +17,10 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from keys import listing, mapping
+from keys import listing, looks, mapping
 from keys.context import EXIT_OK, Context, UsageError
 from keys.kinds import KINDS, VALUE_FIELD
 from keys.op import Op, OpError
-from keys.scanning import PATTERNS
 
 VAULT = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}")
 
@@ -68,21 +67,14 @@ def item_json(kind: str, name: str) -> dict[str, Any]:
 
 
 OWNER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@-]{0,63}")
-LONG_RUN = re.compile(r"[^\s]{24,}")
-URL = re.compile(r"https?://[A-Za-z0-9.-]+(?:/[A-Za-z0-9._~%/-]*)?(?:#[A-Za-z0-9_-]*)?")
-NAME_PART = 16
-UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
 def _refuse_value(flag: str, text: str) -> None:
     """Text bound for the mapping file (a committed file) or the screen must not look like a
     value pasted into the wrong flag. The text is never repeated back."""
-    if any(not c.isprintable() for c in text) or any(0xD800 <= ord(c) <= 0xDFFF for c in text):
+    if looks.unprintable(text):
         raise UsageError(f"{flag} holds a control or unprintable character")
-    for run in LONG_RUN.findall(URL.sub(" ", text)):  # a plain link is not a key
-        if any(c.isalpha() for c in run) and any(c.isdigit() for c in run):
-            raise UsageError(f"{flag} holds something shaped like a key; nothing was made")
-    if any(p.search(text.encode()) for p in PATTERNS.values()):
+    if looks.looks_like_value(text):
         raise UsageError(f"{flag} holds something shaped like a key; nothing was made")
 
 
@@ -93,7 +85,7 @@ def run(args: argparse.Namespace, ctx: Context) -> int:
     reason: str = args.kept_because
     owner: str | None = args.owner
     _refuse_value("the name", name)
-    if any(len(part) > NAME_PART for part in name.split("-")) or UUID.search(name):
+    if looks.name_looks_like_value(name):
         raise UsageError("the name looks like a value; give it a short descriptive name")
     if not mapping.NAME.fullmatch(name):
         raise UsageError("the name must be lower-case letters, digits and dashes")
