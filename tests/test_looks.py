@@ -71,7 +71,7 @@ def test_every_shape_rule_is_in_the_module() -> None:
 # ---------------------------------------------------------------------------- names (keys new)
 
 
-@pytest.mark.parametrize("name", ["app-thing", "deploy", "partygame-resend"])
+@pytest.mark.parametrize("name", ["app-thing", "deploy", "app-resend"])
 def test_a_short_name_is_fine(name: str) -> None:
     assert not looks.name_looks_like_value(name)
 
@@ -92,7 +92,7 @@ def test_a_name_shaped_like_a_value(name: str) -> None:
         f"{UUID}.jsonl",  # a Claude session transcript: named today, still named
         UUID,  # a file-history folder
         "-Users-jason-Code-gh-keys-wt-looks2",  # a Claude project folder
-        "-private-tmp-claude-501-Users-jason-Code-gh-auditor",
+        "-private-tmp-claude-501-Users-owner-Code-app",
         "agent-a1b2c3d4e5f6a7b8c.jsonl",
         "snapshot-zsh-1732212345-abc123.sh",
         "history.jsonl",
@@ -238,7 +238,7 @@ TMP_SEGMENT = "zl8x4p0n3x5bh1f2dw7gm7jw" + "0000gn"  # macOS /var/folders/<xx>/<
     [
         f"{UPPER_UUID}.history",
         f"{UPPER_UUID}.session",
-        f"-private-tmp-claude-501-Users-jason-Code-gh-auditor-{UUID}-scratchpad",
+        f"-private-tmp-claude-501-Users-owner-Code-app-{UUID}-scratchpad",
         f"{UUID}-agent-{UUID}.json",
         f"{UUID}_{UUID}",
         SHA,

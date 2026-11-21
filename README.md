@@ -4,7 +4,7 @@ A small command-line tool for the owner's credentials that never prints, logs or
 credential's value. It reads values from 1Password in memory, passes them only on stdin or in a
 child's environment, and prints names, fingerprints, dates and verdicts.
 
-Phase 1 of the design (list, check, scan, scrub and new), and from phase 2, sync, fp and leaks (the last two taken over from the old key checker). `keys list` and the `generic` kind
+Phase 1 of the design (list, check, scan, scrub and new), and from phase 2, sync, check --all, fp and leaks (the last two taken over from the old key checker). `keys list` and the `generic` kind
 are additions to the design's lists. See [What is next](#what-is-next).
 
 ## The mapping file
@@ -15,6 +15,7 @@ targets, fingerprints and dates. Never a value. `--mapping PATH`, else `$KEYS_MA
 
 ```toml
 kept_budget = 3                          # optional: most kept credentials allowed
+ignore_unmapped = ["DATA_LEAK_DENYLIST"] # optional: secrets at mapped scopes that are not credentials
 
 [[credential]]
 name = "app-mail"
@@ -116,6 +117,52 @@ $ keys leaks report.json
 fp:3f9a1c02  github-pat  src/settings.py (+2 more)  4 findings in 3 commits, first 1a2b3c4d, 2025-01-02..2025-03-04
 keys leaks: 1 leaked value in 4 findings
 ```
+
+### `keys check --all [--deep]`
+
+Every credential at every target. `--all` is the nightly CI check: it never starts 1Password and
+needs no fingerprint key or any value. It prints what `keys list` prints, then one line per
+target:
+
+- GitHub (repo, environment, organisation): the secret is there by name, and its update date is
+  not before the credential's `rotated` date (GitHub cannot be read back, so the date stands
+  for the value);
+- Key Vault and Secret Manager: the secret is there, and the `keys-fp` tag or label `keys sync`
+  wrote equals the mapping file's `fp`;
+- Railway: skipped, since any listing of its variables holds their values (checked with
+  `--deep`);
+- any secret at a mapped repo, environment, organisation, vault or project that no mapping row
+  names. A name that is not a credential (a CI setting held as a secret) goes in the mapping
+  file's `ignore_unmapped = ["NAME", ...]`. Railway variables are not checked for this: most are
+  settings, not secrets.
+
+`--deep` is for the Mac. It needs the fingerprint key, reads each value from 1Password in process
+and compares its keyed fingerprint with the mapping file's, reads each Railway variable in process
+and compares it with 1Password's, compares every tag and label with the real value, and lists
+every 1Password item tagged `keys` (names and dates only): each must be in the mapping file and
+updated within 180 days, which catches an item rotated by hand.
+
+```text
+$ keys check --all --mapping keys/mapping.toml
+NAME      KIND     FP           EXPIRES     LEFT  LIFETIME  NOTES
+app-mail  generic  fp:1a2b3c4d  2027-04-30  160   180       expiry from rotation
+
+1 credential kept, no problems
+
+app-mail  github-actions owner/app MAIL_KEY  present
+app-mail  github-actions-env owner/app env:production MAIL_KEY  updated 2026-10-15, before it was rotated on 2026-11-01
+app-mail  azure-key-vault app-kv mail-key  present, fingerprint tag matches
+app-mail  railway app/production MAIL_API_KEY  skipped: Railway is checked with --deep
+-  github-actions owner/app  STRAY_TOKEN: not in the mapping file
+keys check --all: 1 credential, 4 targets, 2 problems
+```
+
+Exit 0 when clean, 1 on any problem, 3 for a usage error. A scope keys cannot list (no sign-in,
+no permission) is a problem: a check that cannot look must not pass. A store's error text is
+never shown, only the program and its exit code; a secret name read from a store that is not a
+plain name, or looks like a value, is printed as `<name withheld>`. In CI, `gh` signs in with
+`GH_TOKEN`, which needs read access to the repos' secrets and environments (and the
+organisation's secrets, for an org target).
 
 ### `keys scan`
 
@@ -262,6 +309,29 @@ advice. What else differs:
 - **Key Vault values are read exactly** (as JSON), so a value's own trailing newline is kept;
   check_key.py dropped it.
 
+## The daily scan
+
+`launchd/com.kilotronic.keys-scan.plist` runs `keys scan` every day at 09:15 through a login
+`zsh`, so `keys` and `op` are found on the owner's own `PATH`. Its log,
+`~/Library/Logs/keys/scan.log`, holds only what the scan prints: file names, line numbers,
+credential names and counts. To install it (by hand; nothing in keys installs it):
+
+```sh
+mkdir -p ~/Library/Logs/keys ~/Library/LaunchAgents
+cp launchd/com.kilotronic.keys-scan.plist ~/Library/LaunchAgents/
+# edit the two marked lines: the mapping file's path, and OWNER in the log path
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.kilotronic.keys-scan.plist
+launchctl kickstart gui/$(id -u)/com.kilotronic.keys-scan   # one run now, to see it work
+```
+
+To remove it: `launchctl bootout gui/$(id -u)/com.kilotronic.keys-scan`, then delete the file
+from `~/Library/LaunchAgents`.
+
+The known-value pass reads every credential from 1Password, so a scheduled run asks for Touch ID
+when the Mac is unlocked and fails to read the values when nobody answers (the scan then exits 2
+and says which values it could not search for). For a run that never asks, add `--patterns-only`
+to the command in the plist: shapes only, no 1Password.
+
 ## Does this text look like a value?
 
 One module, `keys.looks`, answers it for every place keys might repeat text. Text looks like a
@@ -323,8 +393,7 @@ Phase 2, from the design:
   record), resuming after the owner's paste, with rollback until the old key is revoked. Takes
   over the Railway, signing-secret, datastore and Twilio rotation of the script it replaces.
 - Revoke by API where the provider has one; otherwise open the provider's page for the owner.
-- `keys check --all [--deep]` against the targets: in sync, unmapped secrets, and 1Password items
-  not updated in 180 days.
+- An issue from day 120 in the nightly check (the workflow lives in the mapping repo).
 - The gitleaks pass in `keys scan`, with the shared secret-scan rules and `--redact`, and a
   scan of only the files changed since the last run, for speed.
 - `keys rotate --dry-run` and `--now`.
@@ -332,7 +401,5 @@ Phase 2, from the design:
   `twilio-key`, `azure-app-secret`, and `generated` (a random signing secret, with `mint`).
 - Probes for Railway, Resend and Twilio, so the old rotation script can become a thin shim and
   then be deleted.
-- The schedules: the nightly CI run with an issue from day 120, and a daily launchd `keys scan`
-  on the Mac.
 - A check, once, that `op item create` keeps the empty non-secret fields `keys new` asks for
   (`op item create --dry-run` previews without saving).

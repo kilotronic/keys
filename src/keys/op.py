@@ -53,3 +53,22 @@ class Op:
             ["op", "item", "create", "--vault", vault, "-"],
             stdin=json.dumps(item),
         )
+
+    def items_tagged(self, tag: str) -> list[dict[str, str]]:
+        """Each item with tag: its vault, title and last update (op lists no field values)."""
+        out = self._run("listing items", ["op", "item", "list", "--tags", tag, "--format", "json"])
+        try:
+            items = cast(list[dict[str, Any]], json.loads(out or "[]"))
+        except ValueError:
+            raise OpError("op item list printed something keys cannot read") from None
+        rows: list[dict[str, str]] = []
+        for i in items:
+            vault = cast(dict[str, Any], i.get("vault") or {})
+            rows.append(
+                {
+                    "vault": str(vault.get("name", "")),
+                    "title": str(i.get("title", "")),
+                    "updated_at": str(i.get("updated_at", "")),
+                }
+            )
+        return rows

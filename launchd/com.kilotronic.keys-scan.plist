@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  keys scan, once a day, on the owner's Mac. Install and remove: see the README (`The daily scan`).
+  Edit the two paths marked EDIT before installing. launchd does not expand ~ or $HOME, so they
+  are absolute. The log holds only what keys scan prints: file names, line numbers, credential
+  names and counts, never a value.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.kilotronic.keys-scan</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>-l</string>
+    <string>-c</string>
+    <string>mkdir -p "$HOME/Library/Logs/keys" &amp;&amp; exec keys scan</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- EDIT: the mapping file to search for known values. -->
+    <key>KEYS_MAPPING</key>
+    <string>/Users/OWNER/path/to/keys.toml</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>9</integer>
+    <key>Minute</key>
+    <integer>15</integer>
+  </dict>
+  <!-- EDIT: OWNER is the Mac account name. -->
+  <key>StandardOutPath</key>
+  <string>/Users/OWNER/Library/Logs/keys/scan.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/OWNER/Library/Logs/keys/scan.log</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+</dict>
+</plist>

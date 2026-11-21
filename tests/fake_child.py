@@ -137,7 +137,9 @@ def main(prog: str, argv: list[str]) -> int:
             print(lfail["stderr"], file=sys.stderr)
             return int(lfail["code"])
         vault = flags.get("--vault")
+        tag = flags.get("--tags")
         items = [i for i in db["items"] if vault is None or i["vault"]["name"] == vault]
+        items = [i for i in items if tag is None or tag in i.get("tags", [])]
         print(json.dumps(items))
         return 0
     if words[:2] == ["item", "create"]:
