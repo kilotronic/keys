@@ -320,19 +320,62 @@ def configure_install(p: argparse.ArgumentParser) -> None:
 
 
 def configure_gh(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--app", help="the App credential's name (default: $KEYS_GH_APP)")
+    p.add_argument(
+        "--app",
+        help="the App credential's name (default: the owner's in $KEYS_GH_APPS,"
+        " or $KEYS_GH_APP when no map is set)",
+    )
     p.add_argument("gh_args", nargs=argparse.REMAINDER, help="-- then gh's own arguments")
 
 
 def configure_git(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--app", help="the App credential's name (default: $KEYS_GH_APP)")
+    p.add_argument(
+        "--app",
+        help="the App credential's name (default: the owner's in $KEYS_GH_APPS,"
+        " or $KEYS_GH_APP when no map is set)",
+    )
     p.add_argument("operation", choices=["get", "store", "erase"])
 
 
-def _app(args: argparse.Namespace, ctx: Context) -> str:
-    name = args.app or ctx.environ.get("KEYS_GH_APP", "")
+def _fold(owner: str) -> str:
+    # ASCII-only: str.lower() folds some non-ASCII letters (U+212A KELVIN SIGN) to ASCII ones.
+    return owner.translate(_UPPER)
+
+
+_UPPER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def _apps(environ: Mapping[str, str]) -> dict[str, str]:
+    """$KEYS_GH_APPS, `owner=app` pairs split by commas or spaces: each owner's own App."""
+    apps: dict[str, str] = {}
+    for pair in re.split(r"[\s,]+", environ.get("KEYS_GH_APPS", "").strip()):
+        if not pair:
+            continue
+        owner, _, name = pair.partition("=")
+        if not (OWNER.fullmatch(owner) and NAME.match(name)):
+            raise UsageError("$KEYS_GH_APPS wants owner=app pairs, split by commas or spaces")
+        if apps.get(_fold(owner), name) != name:
+            raise UsageError(f"$KEYS_GH_APPS names two Apps for {owner}")
+        apps[_fold(owner)] = name
+    return apps
+
+
+def _app(args: argparse.Namespace, ctx: Context, owner: str) -> str:
+    """--app (the owner's own override), else the owner's App in $KEYS_GH_APPS, else
+    $KEYS_GH_APP. Once the map is set it is the only source and $KEYS_GH_APP is ignored: an
+    owner it doesn't name has no App, so fail closed, never guess."""
+    if not OWNER.fullmatch(owner):
+        raise UsageError("the owner is not a GitHub account name")
+    if args.app:
+        name = args.app
+    elif ctx.environ.get("KEYS_GH_APPS"):
+        name = _apps(ctx.environ).get(_fold(owner), "")
+        if not name:
+            raise UsageError(f"no App for {owner}: add {owner}=<app> to $KEYS_GH_APPS")
+    else:
+        name = ctx.environ.get("KEYS_GH_APP", "")
     if not NAME.match(name):
-        raise UsageError("name the App with --app NAME or $KEYS_GH_APP")
+        raise UsageError("name the App with --app NAME, $KEYS_GH_APPS or $KEYS_GH_APP")
     return name
 
 
@@ -377,9 +420,12 @@ def gh(args: argparse.Namespace, ctx: Context, deps: Deps | None = None) -> int:
         )
     if ctx.environ.get("KEYS_GH_ACTIVE"):
         raise AgentError("keys gh reached itself: $KEYS_REAL_GH or PATH names the shim")
-    name = _app(args, ctx)
+    if not (args.app or ctx.environ.get("KEYS_GH_APPS") or ctx.environ.get("KEYS_GH_APP")):
+        raise UsageError("name the App with --app NAME, $KEYS_GH_APPS or $KEYS_GH_APP")
     owner, repo = target(rest, ctx.environ, origin_url(ctx.cwd(), deps))
-    token = mint(name, owner, repo, deps)
+    if repo is not None and not REPO.fullmatch(repo):
+        raise UsageError("the repo is not a GitHub repository name")
+    token = mint(_app(args, ctx, owner), owner, repo, deps)
     env = {k: v for k, v in ctx.environ.items() if k not in DROP}
     env["GH_TOKEN"] = token.reveal()
     env["KEYS_GH_ACTIVE"] = "1"
@@ -402,7 +448,8 @@ def git_credential(args: argparse.Namespace, ctx: Context, deps: Deps | None = N
         if "=" in line:
             k, v = line.split("=", 1)
             fields[k] = v
-    if fields.get("protocol") != "https" or fields.get("host") != "github.com":
+    host = fields.get("host", "").lower().removesuffix(":443")
+    if fields.get("protocol", "").lower() != "https" or host != "github.com":
         return EXIT_OK  # not ours: git asks the next helper
     # From here the request is github.com's: on any failure tell git to stop (quit=1), so it
     # never asks a later helper holding the owner's own login.
@@ -413,8 +460,9 @@ def git_credential(args: argparse.Namespace, ctx: Context, deps: Deps | None = N
                 "git sent no repo path: set credential.useHttpPath true for github.com"
             )
         owner, repo = found
-        token = mint(_app(args, ctx), owner, repo, deps)
-    except (AgentError, UsageError):
+        token = mint(_app(args, ctx, owner), owner, repo, deps)
+    except BaseException:
+        # Any failure, not only ours: an unexpected one must stop git too.
         ctx.stdout.write("quit=1\n")
         ctx.stdout.flush()
         raise

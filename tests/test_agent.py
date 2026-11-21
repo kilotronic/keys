@@ -457,3 +457,146 @@ def test_the_real_sender_reads_a_whole_token_answer() -> None:
     # A repo-limited token's answer carries full repository objects, well past 4 KB.
     send = agent.Deps().send
     assert getattr(send, "keywords", {}).get("limit", 0) >= 1 << 20
+
+
+# ── Which App, by owner ──────────────────────────────────────────────────────
+
+
+def _keychain_services(f: Fakes) -> list[str]:
+    return [
+        argv[argv.index("-s") + 1]
+        for argv, _, _ in f.runs
+        if argv[:2] == ["security", "find-generic-password"]
+    ]
+
+
+# jasonluther maps to an App unlike $KEYS_GH_APP, so a skipped lookup cannot pass unseen.
+APPS = {"KEYS_GH_APPS": "acme-corp=acme-agents, jasonluther=jl-agents kilotronic=k-agents"}
+
+
+def map_only(environ: Mapping[str, str] | None = None, stdin: str = "") -> Context:
+    c = ctx(stdin=stdin, environ={**APPS, **(environ or {})})
+    c.environ = {k: v for k, v in c.environ.items() if k != "KEYS_GH_APP"}
+    return c
+
+
+def test_each_owner_gets_its_own_app() -> None:
+    f = Fakes(installed={"acme-corp": 9, "jasonluther": 7})
+    agent.gh(gh_args("pr", "list", "-R", "acme-corp/widgets"), map_only(), f.deps())
+    first = _keychain_services(f)
+    agent.gh(gh_args("pr", "list", "-R", "jasonluther/partygame"), map_only(), f.deps())
+    second = _keychain_services(f)[len(first) :]
+    assert first
+    assert all("acme-agents" in s for s in first)
+    assert second
+    assert all("jl-agents" in s for s in second)
+
+
+def test_owner_case_maps_to_the_same_app() -> None:
+    f = Fakes(installed={"Acme-Corp": 9})  # GitHub matches names in any case; the fake doesn't
+    agent.gh(gh_args("pr", "list", "-R", "Acme-Corp/widgets"), map_only(), f.deps())
+    assert all("acme-agents" in s for s in _keychain_services(f))
+
+
+def test_the_map_wins_over_a_leftover_single_app() -> None:
+    f = Fakes()
+    c = ctx(environ=APPS)  # also sets KEYS_GH_APP=kilotronic-agents
+    with pytest.raises(UsageError, match="no App for someone-else"):
+        agent.gh(gh_args("pr", "list", "-R", "someone-else/repo"), c, f.deps())
+    assert f.sends == []
+    assert f.gh_calls == []
+
+
+def test_a_non_ascii_owner_never_folds_onto_a_mapped_one() -> None:
+    f = Fakes(installed={"kilotronic": 8})
+    with pytest.raises(UsageError):
+        agent.gh(gh_args("api", "https://github.com/\u212ailotronic/x"), map_only(), f.deps())
+    assert f.sends == []
+
+
+def test_two_apps_for_one_owner_is_a_usage_error() -> None:
+    c = map_only({"KEYS_GH_APPS": "acme-corp=acme-agents Acme-Corp=k-agents"})
+    with pytest.raises(UsageError, match="two Apps"):
+        agent.gh(gh_args("pr", "list", "-R", "acme-corp/widgets"), c, Fakes().deps())
+
+
+def test_a_malformed_app_map_is_a_usage_error() -> None:
+    c = map_only({"KEYS_GH_APPS": "acme-corp"})
+    with pytest.raises(UsageError, match="KEYS_GH_APPS"):
+        agent.gh(gh_args("pr", "list", "-R", "acme-corp/widgets"), c, Fakes().deps())
+
+
+def test_app_flag_wins_even_over_a_malformed_map() -> None:
+    f = Fakes(installed={"acme-corp": 9})
+    c = map_only({"KEYS_GH_APPS": "acme-corp"})
+    agent.gh(gh_args("pr", "list", "-R", "acme-corp/widgets", app="k-agents"), c, f.deps())
+    assert all("k-agents" in s for s in _keychain_services(f))
+
+
+def test_no_app_source_is_named_before_any_git_call() -> None:
+    f = Fakes()
+    c = ctx()
+    c.environ = {"KEYS_REAL_GH": "/x/gh"}
+    with pytest.raises(UsageError, match="--app"):
+        agent.gh(gh_args("pr", "list"), c, f.deps())
+    assert f.runs == []
+
+
+GIT_IN = "protocol=https\nhost=github.com\npath={path}\n"
+
+
+def test_git_credential_picks_the_app_by_the_path_owner() -> None:
+    f = Fakes(installed={"acme-corp": 9})
+    c = map_only(stdin=GIT_IN.format(path="acme-corp/widgets.git"))
+    agent.git_credential(argparse.Namespace(app=None, operation="get"), c, f.deps())
+    assert _keychain_services(f)
+    assert all("acme-agents" in s for s in _keychain_services(f))
+
+
+@pytest.mark.parametrize("env", [{}, {"KEYS_GH_APPS": "acme-corp"}])
+def test_git_credential_quits_on_an_app_map_refusal(env: dict[str, str]) -> None:
+    f = Fakes()
+    c = map_only(env, stdin=GIT_IN.format(path="someone-else/repo.git"))
+    with pytest.raises(UsageError):
+        agent.git_credential(argparse.Namespace(app=None, operation="get"), c, f.deps())
+    assert out(c) == "quit=1\n"
+    assert f.sends == []
+
+
+def test_git_credential_ignores_a_leftover_single_app_for_an_unmapped_owner() -> None:
+    f = Fakes()
+    c = ctx(stdin=GIT_IN.format(path="someone-else/repo.git"), environ=APPS)
+    with pytest.raises(UsageError):
+        agent.git_credential(argparse.Namespace(app=None, operation="get"), c, f.deps())
+    assert out(c) == "quit=1\n"
+    assert f.sends == []
+
+
+def test_git_credential_quits_on_an_unexpected_failure() -> None:
+    f = Fakes(installed={"acme-corp": 9})
+
+    def boom(*_: object) -> agent.Answer:
+        raise RuntimeError("unexpected")
+
+    deps = f.deps()
+    deps = agent.Deps(run=deps.run, send=boom, now=deps.now, exec_gh=deps.exec_gh)
+    c = map_only(stdin=GIT_IN.format(path="acme-corp/widgets.git"))
+    with pytest.raises(RuntimeError):
+        agent.git_credential(argparse.Namespace(app=None, operation="get"), c, deps)
+    assert out(c) == "quit=1\n"
+
+
+@pytest.mark.parametrize("host", ["GitHub.com", "github.com:443"])
+def test_git_credential_claims_github_in_any_spelling(host: str) -> None:
+    f = Fakes(installed={"acme-corp": 9})
+    c = map_only(stdin=f"protocol=https\nhost={host}\npath=acme-corp/widgets.git\n")
+    agent.git_credential(argparse.Namespace(app=None, operation="get"), c, f.deps())
+    assert "password=" in out(c)
+    assert all("acme-agents" in s for s in _keychain_services(f))
+
+
+def test_a_crafted_owner_is_refused_on_every_app_source() -> None:
+    f = Fakes()
+    with pytest.raises(UsageError):
+        agent.gh(gh_args("api", "https://github.com/..%2Fusers/x", app="k-agents"), ctx(), f.deps())
+    assert f.sends == []
