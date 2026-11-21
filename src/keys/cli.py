@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, NoReturn
 if TYPE_CHECKING:
     from _typeshed import SupportsWrite
 
-from keys import listing
+from keys import checking, listing
 from keys.context import (
     EXIT_INTERNAL,
     EXIT_OK,
@@ -81,7 +81,7 @@ def _parser(ctx: Context, argv: Sequence[str]) -> _Parser:
     listing.configure(
         add("list", "every credential in the mapping file: fingerprint, expiry, lifetime, problems")
     )
-    add("check", "ask a service whether a key works, without printing the key")
+    checking.configure(add("check", "ask a service whether a key works, without printing the key"))
     add("scan", "search transcripts, history and logs for known values and secret shapes")
     add("scrub", "replace found values in one file with a marker, in place")
     add("new", "make an empty 1Password item for a credential and its mapping entry")
@@ -95,6 +95,8 @@ def run(argv: Sequence[str], ctx: Context) -> int:
         raise UsageError("usage: keys <command> [options]; `keys --help` lists the commands")
     if command == "list":
         return listing.run(args, ctx)
+    if command == "check":
+        return checking.run(args, ctx)
     raise UsageError(f"keys {command} is not built yet")
 
 

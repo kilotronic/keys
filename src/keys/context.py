@@ -8,7 +8,7 @@ import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO
+from typing import IO, Any
 
 EXIT_OK, EXIT_FAIL, EXIT_UNKNOWN, EXIT_USAGE, EXIT_INTERNAL = 0, 1, 2, 3, 4
 
@@ -30,6 +30,8 @@ class Context:
     stdin: IO[str] = field(default_factory=lambda: sys.stdin)
     environ: Mapping[str, str] = field(default_factory=lambda: os.environ)
     today: Callable[[], datetime.date] = _today
+    # The HTTPS client keys check uses; None is the real one (keys.probes.send).
+    send: Callable[..., Any] | None = None
 
     def say(self, line: str) -> None:
         print(line, file=self.stdout, flush=True)

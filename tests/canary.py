@@ -200,6 +200,7 @@ class Canary:
         path = self.bin / prog
         path.write_text(
             "#!/bin/sh\n"
+            f'KEYS_FAKE_DB="{self.db_path}" KEYS_FAKE_LOG="{self.log_path}" '
             f'exec env -u PYTHONPATH -u KEYS_CANARY_HOOK_LOG "{sys.executable}" "{FAKE_CHILD}" '
             f'{prog} "$@"\n'
         )
@@ -225,6 +226,11 @@ class Canary:
         if value != self.value and value not in self.extra_values:
             self.extra_values.append(value)
         self._save_db()
+
+    def watch(self, value: str) -> None:
+        """Another made-up value to watch for, besides the canary."""
+        if value != self.value and value not in self.extra_values:
+            self.extra_values.append(value)
 
     def op_fail(self, ref: str, code: int = 1, stderr: str | None = None) -> None:
         """The fake op fails `op read ref`; by default its error text holds the canary."""
@@ -259,8 +265,6 @@ class Canary:
             "TMPDIR": str(self.tmp),
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "LANG": "C.UTF-8",
-            "KEYS_FAKE_DB": str(self.db_path),
-            "KEYS_FAKE_LOG": str(self.log_path),
         }
         return {**env, **(extra or {})}
 
