@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, NoReturn
 if TYPE_CHECKING:
     from _typeshed import SupportsWrite
 
-from keys import checking, creating, listing, scanning
+from keys import checking, creating, listing, scanning, syncing
 from keys.context import (
     EXIT_INTERNAL,
     EXIT_OK,
@@ -69,7 +69,7 @@ def _parser(ctx: Context, argv: Sequence[str]) -> _Parser:
 
     top = make(
         prog="keys",
-        description="Credentials without their values: list, check, scan, scrub and create.",
+        description="Credentials without their values: list, check, scan, scrub, create and sync.",
     )
     sub = top.add_subparsers(dest="command", metavar="<command>", parser_class=_Parser)
 
@@ -91,6 +91,7 @@ def _parser(ctx: Context, argv: Sequence[str]) -> _Parser:
     creating.configure(
         add("new", "make an empty 1Password item for a credential and its mapping entry")
     )
+    syncing.configure(add("sync", "write 1Password's value to every target in the mapping file"))
     return top
 
 
@@ -109,6 +110,8 @@ def run(argv: Sequence[str], ctx: Context) -> int:
         return scanning.scrub(args, ctx)
     if command == "new":
         return creating.run(args, ctx)
+    if command == "sync":
+        return syncing.run(args, ctx)
     raise UsageError(f"keys {command} is not built yet")
 
 

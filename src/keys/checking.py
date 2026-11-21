@@ -67,6 +67,19 @@ def read_key(source: str, ctx: Context, what: str = "key") -> Secret:
     return Secret(text)
 
 
+def read_fp_key(flag: str | None, ctx: Context) -> Secret:
+    """The fingerprint secret, from --fp-key or $KEYS_FP_KEY (op://…, env:NAME or stdin)."""
+    source = flag or ctx.environ.get("KEYS_FP_KEY")
+    if not source:
+        raise UsageError(
+            "no fingerprint key: give --fp-key or set KEYS_FP_KEY to op://… or env:NAME"
+        )
+    fp_key = read_key(source, ctx, "fingerprint key")
+    if len(fp_key) < FP_KEY_MIN:
+        raise UsageError(f"the fingerprint key must be at least {FP_KEY_MIN} characters")
+    return fp_key
+
+
 def run(args: argparse.Namespace, ctx: Context) -> int:
     if args.list:
         for p in probes.PROVIDERS.values():
@@ -80,16 +93,9 @@ def run(args: argparse.Namespace, ctx: Context) -> int:
         raise UsageError("unknown service; `keys check --list` names them")
     if not args.key:
         raise UsageError(f"--key is required: {SOURCES}")
-    fp_source: str | None = args.fp_key or ctx.environ.get("KEYS_FP_KEY")
-    if not fp_source:
-        raise UsageError(
-            "no fingerprint key: give --fp-key or set KEYS_FP_KEY to op://… or env:NAME"
-        )
-    if args.key == "stdin" and fp_source == "stdin":
+    if args.key == "stdin" and (args.fp_key or ctx.environ.get("KEYS_FP_KEY")) == "stdin":
         raise UsageError("the key and the fingerprint key cannot both come from stdin")
-    fp_key = read_key(fp_source, ctx, "fingerprint key")
-    if len(fp_key) < FP_KEY_MIN:
-        raise UsageError(f"the fingerprint key must be at least {FP_KEY_MIN} characters")
+    fp_key = read_fp_key(args.fp_key, ctx)
     key = read_key(args.key, ctx)
     opts = probes.Options(
         client_id=args.client_id,

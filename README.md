@@ -4,7 +4,7 @@ A small command-line tool for the owner's credentials that never prints, logs or
 credential's value. It reads values from 1Password in memory, passes them only on stdin or in a
 child's environment, and prints names, fingerprints, dates and verdicts.
 
-Phase 1 of the design: list, check, scan, scrub and new. `keys list` and the `generic` kind
+Phase 1 of the design (list, check, scan, scrub and new), and from phase 2, sync. `keys list` and the `generic` kind
 are additions to the design's lists. See [What is next](#what-is-next).
 
 ## The mapping file
@@ -143,6 +143,46 @@ next: paste the value into its credential field in the 1Password app (never a te
 
 Kinds: `github-app-key`, `github-pat`, `railway-project-token`, `cloudflare-token`, `generic`.
 
+### `keys sync <name> | --all [--dry-run]`
+
+Writes the value in 1Password to every target the mapping file lists for that credential. The
+value is read in process and handed to each target's own command line on its stdin, never its
+arguments, a file or the terminal:
+
+| Target               | Command                                                                     |
+| -------------------- | --------------------------------------------------------------------------- |
+| `github-actions`     | `gh secret set NAME --repo R`                                               |
+| `github-actions-env` | `gh secret set NAME --repo R --env E`                                       |
+| `github-actions-org` | `gh secret set NAME --org O --visibility selected --repos a,b` (or private) |
+| `railway`            | `railway variable set KEY --stdin --skip-deploys --service S ...`           |
+| `azure-key-vault`    | `az keyvault secret set --file /dev/stdin --tags keys-fp=<fp>`              |
+| `gcp-secret`         | `gcloud secrets versions add NAME --data-file=-`, then a `keys-fp` label    |
+
+Railway variables are staged without a deploy; then each Railway service is redeployed once and
+waited for, told apart from the old deployment by its id (`--no-deploy` skips that). Key Vault
+and Secret Manager get the keyed fingerprint as a tag or label, so a later check can compare it
+without the value. Each program sees only the basic variables of keys's environment and its own
+(`GH_`/`GITHUB_`, `RAILWAY_`, `AZURE_`, `CLOUDSDK_`/`GOOGLE_`).
+
+```text
+$ keys sync app-mail
+app-mail  github-actions owner/app MAIL_KEY  fp:1a2b3c4d  written
+app-mail  railway app/production MAIL_API_KEY  fp:1a2b3c4d  written
+app (production): deployed
+keys sync: 2 targets written for 1 credential
+```
+
+- The first failure stops the sync, naming the target and how many were written before it. Run
+  it again once the cause is fixed: writing the same value twice is harmless.
+- A value whose fingerprint differs from the `fp` the mapping file records is refused without
+  `--force`: 1Password was changed outside `keys rotate`, and writing it could replace a good
+  value everywhere.
+- Every target field goes on a program's command line, so each must be a plain name (a repo,
+  a secret name); a field that is not, or looks like a key, is refused and not printed. A Railway
+  project id is checked but never printed, since a UUID is also the shape of a Railway token.
+- `--dry-run` reads nothing from 1Password and writes nothing: it names each target, whether
+  the secret is there yet, and fails if a target cannot be listed.
+- It needs the fingerprint key (`--fp-key` or `$KEYS_FP_KEY`), as `keys check` does.
 ## Does this text look like a value?
 
 One module, `keys.looks`, answers it for every place keys might repeat text. Text looks like a
@@ -177,7 +217,9 @@ a fake 1Password and fake services, runs the command, and fails if the value rea
 - the text of an exception that escapes;
 - any child process's argv or environment. An audit hook records every child as it starts, and
   any program that is not one of the harness's fakes on `PATH` fails the test. Piping the value
-  to a child is allowed only for `op item create` and `op item edit`;
+  to a child is allowed only for `op item create` and `op item edit`, and for each target's
+  write command (`gh secret set`, `railway variable set`, `az keyvault secret set`,
+  `gcloud secrets versions add`, `gcloud secrets create`);
 - any file: a write under the temp folder, or outside the temporary home and working folder,
   fails at once; after the run no file there may hold the value unless the test planted it and
   it is unchanged;
@@ -197,14 +239,12 @@ Phase 2, from the design:
 - `keys rotate <name>`: the eight steps (preflight, create, probe, store, sync, verify, revoke,
   record), resuming after the owner's paste, with rollback until the old key is revoked. Takes
   over the Railway, signing-secret, datastore and Twilio rotation of the script it replaces.
-- `keys sync <name> | --all`: 1Password to every target in the mapping (GitHub Actions secrets,
-  Railway variables, Azure Key Vault, GCP Secret Manager), values on stdin only.
 - Revoke by API where the provider has one; otherwise open the provider's page for the owner.
 - `keys check --all [--deep]` against the targets: in sync, unmapped secrets, and 1Password items
   not updated in 180 days; `keys fp <name>`.
 - The gitleaks pass in `keys scan`, with the shared secret-scan rules and `--redact`, and a
   scan of only the files changed since the last run, for speed.
-- `keys rotate --dry-run` and `--now`, and `keys sync --dry-run`.
+- `keys rotate --dry-run` and `--now`.
 - The design's other starting kinds: `railway-workspace-token`, `openai-key`, `resend-key`,
   `twilio-key`, `azure-app-secret`, and `generated` (a random signing secret, with `mint`).
 - Probes for Railway, Resend and Twilio, and the old checker's Key Vault and gitleaks-report

@@ -413,3 +413,52 @@ def test_a_deleted_file_or_a_folder_named_after_the_value_is_caught(canary: Cana
 
     with pytest.raises(LeakError, match="file name"):
         canary.call(folder)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["gh", "secret", "set", "S", "--repo", "o/r"],
+        ["railway", "variable", "set", "K", "--stdin", "--service", "s", "--environment", "e"],
+        [
+            "az",
+            "keyvault",
+            "secret",
+            "set",
+            "--vault-name",
+            "v",
+            "--name",
+            "n",
+            "--file",
+            "/dev/stdin",
+        ],
+        ["gcloud", "secrets", "versions", "add", "n", "--project", "p", "--data-file=-"],
+        ["gcloud", "secrets", "create", "n", "--project", "p", "--data-file=-"],
+    ],
+)
+def test_child_stdin_is_allowed_for_each_target_write(canary: Canary, argv: list[str]) -> None:
+    def write(ctx: Context) -> int:
+        subprocess.run(argv, input=canary.value, text=True, check=False, capture_output=True)
+        return 0
+
+    result = canary.call(write)
+    assert result.children[0].stdin == canary.value
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["az", "keyvault", "secret", "show", "--vault-name", "v", "--name", "n"],
+        ["gh", "secret", "list", "--repo", "o/r"],
+        ["railway", "variable", "list", "--service", "s"],
+        ["gcloud", "secrets", "update", "n", "--project", "p"],
+        ["gh", "api", "secret", "set"],
+    ],
+)
+def test_child_stdin_is_refused_for_anything_but_a_write(canary: Canary, argv: list[str]) -> None:
+    def other(ctx: Context) -> int:
+        subprocess.run(argv, input=canary.value, text=True, check=False, capture_output=True)
+        return 0
+
+    with pytest.raises(LeakError, match="stdin of"):
+        canary.call(other)

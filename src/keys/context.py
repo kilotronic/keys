@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import os
 import sys
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,6 +33,8 @@ class Context:
     today: Callable[[], datetime.date] = _today
     # The HTTPS client keys check uses; None is the real one (keys.probes.send).
     send: Callable[..., Any] | None = None
+    # How keys waits between looks at a deployment; tests make it instant.
+    sleep: Callable[[float], None] = time.sleep
 
     def say(self, line: str) -> None:
         print(line, file=self.stdout, flush=True)
