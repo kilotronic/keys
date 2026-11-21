@@ -275,6 +275,25 @@ def target(
                 return m.group(1), m.group(2)
             if not a.lstrip("/").startswith("repos/"):
                 return m.group(1), None
+    # `gh project --owner X` names an account, not a repo, so its token is the whole
+    # installation's; a call naming nothing (`gh project item-edit`) takes $KEYS_GH_OWNER,
+    # which a caller sets once, ahead of the repo it happens to run in.
+    for i, a in enumerate(args):
+        given = None
+        if a == "--owner":
+            given = args[i + 1] if i + 1 < len(args) else ""
+        elif a.startswith("--owner="):
+            given = a.split("=", 1)[1]
+        if given == "@me":
+            break  # gh's signed-in user: an App has none, so the next source decides
+        if given is not None:
+            if OWNER.fullmatch(given):
+                return given, None
+            raise UsageError("--owner must name a GitHub account")
+    if named := environ.get("KEYS_GH_OWNER"):
+        if OWNER.fullmatch(named):
+            return named, None
+        raise UsageError("$KEYS_GH_OWNER must name a GitHub account")
     if origin and (m := _URL.match(origin.strip())):
         return m.group(1), (m.group(2) or "").removesuffix(".git") or None
     if default := environ.get("KEYS_GH_DEFAULT_OWNER"):

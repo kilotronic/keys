@@ -134,12 +134,51 @@ def gh_args(*rest: str, app: str | None = None) -> argparse.Namespace:
         ),
         (["pr", "list"], {}, "https://github.com/kilotronic/keys.git", ("kilotronic", "keys")),
         (["auth", "status"], {"KEYS_GH_DEFAULT_OWNER": "jasonluther"}, None, ("jasonluther", None)),
+        (["project", "view", "1", "--owner", "example-org"], {}, None, ("example-org", None)),
+        (["project", "field-list", "1", "--owner=example-org"], {}, None, ("example-org", None)),
+        (
+            ["project", "view", "1", "--owner", "example-org"],
+            {},
+            "git@github.com:jasonluther/partygame.git",
+            ("example-org", None),
+        ),
+        (
+            ["project", "item-edit", "--id", "PVTI_x", "--project-id", "PVT_y"],
+            {"KEYS_GH_OWNER": "example-org", "KEYS_GH_DEFAULT_OWNER": "jasonluther"},
+            "git@github.com:jasonluther/partygame.git",
+            ("example-org", None),
+        ),
+        (
+            ["pr", "list", "-R", "kilotronic/keys"],
+            {"KEYS_GH_OWNER": "example-org"},
+            None,
+            ("kilotronic", "keys"),
+        ),
+        (
+            ["project", "list", "--owner", "@me"],
+            {"KEYS_GH_DEFAULT_OWNER": "jasonluther"},
+            None,
+            ("jasonluther", None),
+        ),
+        (
+            ["pr", "list"],
+            {"KEYS_GH_OWNER": ""},
+            "https://github.com/kilotronic/keys.git",
+            ("kilotronic", "keys"),
+        ),
     ],
 )
 def test_the_owner_comes_from_the_call_then_the_repo(
     args: list[str], env: dict[str, str], origin: str | None, want: tuple[str, str | None]
 ) -> None:
     assert agent.target(args, env, origin) == want
+
+
+def test_an_owner_flag_without_a_name_is_a_usage_error() -> None:
+    with pytest.raises(UsageError):
+        agent.target(["project", "view", "1", "--owner"], {}, None)
+    with pytest.raises(UsageError):
+        agent.target(["project", "view", "1", "--owner=not/valid"], {}, None)
 
 
 def test_no_owner_at_all_is_a_usage_error() -> None:
@@ -420,6 +459,24 @@ def test_the_token_is_limited_to_the_one_repo() -> None:
     deps.send = send
     agent.gh(gh_args("pr", "list", "-R", "jasonluther/partygame"), ctx(), deps)
     assert json.loads(bodies[0] or b"{}") == {"repositories": ["partygame"]}
+
+
+def test_an_owner_flag_mints_a_token_for_the_whole_installation() -> None:
+    # gh project names an account, not a repo: a token for one repo could not see its boards.
+    f = Fakes()
+    calls: list[tuple[str, str, bytes | None]] = []
+    original = f.send
+
+    def send(method: str, url: str, headers: dict[str, str], data: bytes | None) -> Answer:
+        calls.append((method, url, data))
+        return original(method, url, headers, data)
+
+    deps = f.deps()
+    deps.send = send
+    agent.gh(gh_args("project", "view", "1", "--owner", "jasonluther"), ctx(), deps)
+    posts = [(u, d) for m, u, d in calls if m == "POST"]
+    assert json.loads(posts[0][1] or b"{}") == {}
+    assert not any("/repos/" in u for _, u, _ in calls)
 
 
 def test_an_lfs_path_names_its_repo() -> None:
