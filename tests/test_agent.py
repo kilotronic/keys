@@ -85,7 +85,10 @@ class TTY(io.StringIO):
 def ctx(
     stdin: str = "", environ: Mapping[str, str] | None = None, stdout: io.StringIO | None = None
 ):
-    env = {"KEYS_GH_APP": "kilotronic-agents", "KEYS_REAL_GH": "/opt/homebrew/bin/gh"}
+    env = {
+        "KEYS_GH_APPS": "jasonluther=kilotronic-agents kilotronic=kilotronic-agents",
+        "KEYS_REAL_GH": "/opt/homebrew/bin/gh",
+    }
     env.update(environ or {})
     c = Context(
         stdout=stdout or io.StringIO(), stderr=io.StringIO(), stdin=io.StringIO(stdin), environ=env
@@ -223,8 +226,9 @@ def test_a_failed_revoke_warns_without_the_token() -> None:
 
 def test_an_owner_with_no_installation_fails_closed_and_never_runs_gh() -> None:
     f = Fakes(installed={"jasonluther": 7})
+    c = ctx(environ={"KEYS_GH_APPS": "someone=kilotronic-agents"})
     with pytest.raises(agent.AgentError, match="not installed on someone/repo"):
-        agent.gh(gh_args("pr", "list", "-R", "someone/repo"), ctx(), f.deps())
+        agent.gh(gh_args("pr", "list", "-R", "someone/repo"), c, f.deps())
     assert f.gh_calls == []
     assert not any(m == "POST" for m, _, _ in f.sends)
 
@@ -527,14 +531,12 @@ def _keychain_services(f: Fakes) -> list[str]:
     ]
 
 
-# jasonluther maps to an App unlike $KEYS_GH_APP, so a skipped lookup cannot pass unseen.
+# Each owner maps to its own App, unlike ctx()'s default, so a skipped lookup cannot pass unseen.
 APPS = {"KEYS_GH_APPS": "acme-corp=acme-agents, jasonluther=jl-agents kilotronic=k-agents"}
 
 
 def map_only(environ: Mapping[str, str] | None = None, stdin: str = "") -> Context:
-    c = ctx(stdin=stdin, environ={**APPS, **(environ or {})})
-    c.environ = {k: v for k, v in c.environ.items() if k != "KEYS_GH_APP"}
-    return c
+    return ctx(stdin=stdin, environ={**APPS, **(environ or {})})
 
 
 def test_each_owner_gets_its_own_app() -> None:
@@ -555,11 +557,12 @@ def test_owner_case_maps_to_the_same_app() -> None:
     assert all("acme-agents" in s for s in _keychain_services(f))
 
 
-def test_the_map_wins_over_a_leftover_single_app() -> None:
-    f = Fakes()
-    c = ctx(environ=APPS)  # also sets KEYS_GH_APP=kilotronic-agents
-    with pytest.raises(UsageError, match="no App for someone-else"):
-        agent.gh(gh_args("pr", "list", "-R", "someone-else/repo"), c, f.deps())
+def test_the_retired_single_app_setting_alone_is_refused() -> None:
+    f = Fakes(installed={"kilotronic": 8})
+    c = ctx()
+    c.environ = {"KEYS_GH_APP": "kilotronic-agents", "KEYS_REAL_GH": "/opt/homebrew/bin/gh"}
+    with pytest.raises(UsageError, match=r"\$KEYS_GH_APPS"):
+        agent.gh(gh_args("pr", "list", "-R", "kilotronic/keys"), c, f.deps())
     assert f.sends == []
     assert f.gh_calls == []
 

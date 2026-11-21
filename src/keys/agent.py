@@ -341,8 +341,7 @@ def configure_install(p: argparse.ArgumentParser) -> None:
 def configure_gh(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--app",
-        help="the App credential's name (default: the owner's in $KEYS_GH_APPS,"
-        " or $KEYS_GH_APP when no map is set)",
+        help="the App credential's name (default: the owner's in $KEYS_GH_APPS)",
     )
     p.add_argument("gh_args", nargs=argparse.REMAINDER, help="-- then gh's own arguments")
 
@@ -350,8 +349,7 @@ def configure_gh(p: argparse.ArgumentParser) -> None:
 def configure_git(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--app",
-        help="the App credential's name (default: the owner's in $KEYS_GH_APPS,"
-        " or $KEYS_GH_APP when no map is set)",
+        help="the App credential's name (default: the owner's in $KEYS_GH_APPS)",
     )
     p.add_argument("operation", choices=["get", "store", "erase"])
 
@@ -380,21 +378,18 @@ def _apps(environ: Mapping[str, str]) -> dict[str, str]:
 
 
 def _app(args: argparse.Namespace, ctx: Context, owner: str) -> str:
-    """--app (the owner's own override), else the owner's App in $KEYS_GH_APPS, else
-    $KEYS_GH_APP. Once the map is set it is the only source and $KEYS_GH_APP is ignored: an
-    owner it doesn't name has no App, so fail closed, never guess."""
+    """--app (the owner's own override), else the owner's App in $KEYS_GH_APPS. An owner the
+    map doesn't name has no App, so fail closed, never guess."""
     if not OWNER.fullmatch(owner):
         raise UsageError("the owner is not a GitHub account name")
     if args.app:
         name = args.app
-    elif ctx.environ.get("KEYS_GH_APPS"):
+    else:
         name = _apps(ctx.environ).get(_fold(owner), "")
         if not name:
             raise UsageError(f"no App for {owner}: add {owner}=<app> to $KEYS_GH_APPS")
-    else:
-        name = ctx.environ.get("KEYS_GH_APP", "")
     if not NAME.match(name):
-        raise UsageError("name the App with --app NAME, $KEYS_GH_APPS or $KEYS_GH_APP")
+        raise UsageError("name the App with --app NAME or $KEYS_GH_APPS")
     return name
 
 
@@ -439,8 +434,8 @@ def gh(args: argparse.Namespace, ctx: Context, deps: Deps | None = None) -> int:
         )
     if ctx.environ.get("KEYS_GH_ACTIVE"):
         raise AgentError("keys gh reached itself: $KEYS_REAL_GH or PATH names the shim")
-    if not (args.app or ctx.environ.get("KEYS_GH_APPS") or ctx.environ.get("KEYS_GH_APP")):
-        raise UsageError("name the App with --app NAME, $KEYS_GH_APPS or $KEYS_GH_APP")
+    if not (args.app or ctx.environ.get("KEYS_GH_APPS")):
+        raise UsageError("name the App with --app NAME or $KEYS_GH_APPS")
     owner, repo = target(rest, ctx.environ, origin_url(ctx.cwd(), deps))
     if repo is not None and not REPO.fullmatch(repo):
         raise UsageError("the repo is not a GitHub repository name")
