@@ -4,7 +4,7 @@ A small command-line tool for the owner's credentials that never prints, logs or
 credential's value. It reads values from 1Password in memory, passes them only on stdin or in a
 child's environment, and prints names, fingerprints, dates and verdicts.
 
-Work in progress: see [What is next](#what-is-next).
+Phase 1 of the design: list, check, scan, scrub and new. See [What is next](#what-is-next).
 
 ## The mapping file
 
@@ -123,6 +123,22 @@ break: for those, rotate the key and delete the file if nothing needs it. It pri
 many it replaced. Nobody opens the file to redact it by hand, which would copy the value into a new
 transcript.
 
+### `keys new <kind> <name> --vault <vault> --kept-because <text>`
+
+Makes the empty 1Password item for a credential, and adds its mapping entry. The item is an API
+Credential titled `<kind> <name>`, tagged `keys` and the kind, with an empty concealed
+`credential` field and the kind's other fields (an App's id, a token's id or owner), also empty.
+It goes to `op` as JSON on stdin, never as `field=value` arguments. keys refuses a name already
+in the mapping file or an item title already in the vault.
+
+```text
+$ keys new cloudflare-token deploy --vault <vault> --kept-because "no OIDC sign-in for deploys"
+made the 1Password item cloudflare-token deploy in <vault>, and added deploy to the mapping file
+next: paste the value into its credential field in the 1Password app (never a terminal or a chat)
+```
+
+Kinds: `github-app-key`, `github-pat`, `railway-project-token`, `cloudflare-token`, `generic`.
+
 ## The canary tests
 
 Every command's tests run through one harness, `tests/canary.py`. It plants a made-up value in
@@ -145,3 +161,20 @@ encoded (either case), JSON-escaped, SHA-256, SHA-1 and MD5 forms, any 9-charact
 and any 12-character piece of an encoded form. A hint (the first 8 and last 4 characters) is
 allowed only for a value the test marks provider-issued, since `keys` prints one only for keys a
 provider issued, as the provider's console does.
+
+## What is next
+
+Phase 2, from the design:
+
+- `keys rotate <name>`: the eight steps (preflight, create, probe, store, sync, verify, revoke,
+  record), resuming after the owner's paste, with rollback until the old key is revoked. Takes
+  over the Railway, signing-secret, datastore and Twilio rotation of the script it replaces.
+- `keys sync <name> | --all`: 1Password to every target in the mapping (GitHub Actions secrets,
+  Railway variables, Azure Key Vault, GCP Secret Manager), values on stdin only.
+- Revoke by API where the provider has one; otherwise open the provider's page for the owner.
+- `keys check --all [--deep]` against the targets: in sync, unmapped secrets, and 1Password items
+  not updated in 180 days; `keys fp <name>`.
+- The gitleaks pass in `keys scan`, with the shared secret-scan rules and `--redact`, and a
+  scan of only the files changed since the last run, for speed.
+- Probes for Railway, Resend and Twilio, and the old checker's Key Vault and gitleaks-report
+  sources, so the old scripts can become thin shims and then be deleted.

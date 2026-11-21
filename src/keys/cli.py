@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, NoReturn
 if TYPE_CHECKING:
     from _typeshed import SupportsWrite
 
-from keys import checking, listing, scanning
+from keys import checking, creating, listing, scanning
 from keys.context import (
     EXIT_INTERNAL,
     EXIT_OK,
@@ -88,7 +88,9 @@ def _parser(ctx: Context, argv: Sequence[str]) -> _Parser:
     scanning.configure_scrub(
         add("scrub", "replace found values in one file with a marker, in place")
     )
-    add("new", "make an empty 1Password item for a credential and its mapping entry")
+    creating.configure(
+        add("new", "make an empty 1Password item for a credential and its mapping entry")
+    )
     return top
 
 
@@ -105,6 +107,8 @@ def run(argv: Sequence[str], ctx: Context) -> int:
         return scanning.scan(args, ctx)
     if command == "scrub":
         return scanning.scrub(args, ctx)
+    if command == "new":
+        return creating.run(args, ctx)
     raise UsageError(f"keys {command} is not built yet")
 
 
