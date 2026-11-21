@@ -86,7 +86,13 @@ def _headers(raw: Any) -> dict[str, str]:
         return {}
 
 
-def send(method: str, url: str, headers: dict[str, str], data: bytes | None = None) -> Answer:
+def send(
+    method: str,
+    url: str,
+    headers: dict[str, str],
+    data: bytes | None = None,
+    limit: int = READ_LIMIT,
+) -> Answer:
     handlers: list[urllib.request.BaseHandler] = [_NoRedirect()]
     if _local(urllib.parse.urlsplit(url).hostname or ""):
         handlers.append(urllib.request.ProxyHandler({}))  # this machine: never via a proxy
@@ -96,10 +102,10 @@ def send(method: str, url: str, headers: dict[str, str], data: bytes | None = No
             url, data=data, method=method, headers={"User-Agent": "keys-check", **headers}
         )
         with opener.open(req, timeout=30) as resp:
-            body = resp.read(READ_LIMIT).decode(errors="replace")
+            body = resp.read(limit).decode(errors="replace")
             return Answer(resp.status, body, headers=_headers(resp.headers))
     except urllib.error.HTTPError as e:
-        body = e.read(READ_LIMIT).decode(errors="replace")
+        body = e.read(limit).decode(errors="replace")
         return Answer(e.code, body, headers=_headers(e.headers))
     except urllib.error.URLError as e:
         reason = e.reason

@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, NoReturn
 if TYPE_CHECKING:
     from _typeshed import SupportsWrite
 
-from keys import checking, creating, fpcmd, listing, rotating, scanning, syncing
+from keys import agent, checking, creating, fpcmd, listing, rotating, scanning, syncing
 from keys.context import (
     EXIT_INTERNAL,
     EXIT_OK,
@@ -101,6 +101,15 @@ def _parser(ctx: Context, argv: Sequence[str]) -> _Parser:
         add("leaks", "each leaked value in a gitleaks report, by fingerprint, never the value")
     )
     rotating.configure(add("rotate", "replace a credential end to end: make, store, sync, revoke"))
+    agent.configure_install(
+        add("install-key", "copy a GitHub App key from 1Password into the login keychain, once")
+    )
+    agent.configure_gh(
+        add("gh", "run gh as the agents' GitHub App, with a token minted for the call")
+    )
+    agent.configure_git(
+        add("git-credential", "answer git's credential requests for github.com as the App")
+    )
     return top
 
 
@@ -127,6 +136,15 @@ def run(argv: Sequence[str], ctx: Context) -> int:
         return fpcmd.report(args, ctx)
     if command == "rotate":
         return rotating.run(args, ctx)
+    try:
+        if command == "install-key":
+            return agent.install(args, ctx)
+        if command == "gh":
+            return agent.gh(args, ctx)
+        if command == "git-credential":
+            return agent.git_credential(args, ctx)
+    except agent.AgentError as e:
+        return agent.handle(e, ctx)
     raise UsageError(f"keys {command} is not built yet")
 
 

@@ -488,6 +488,26 @@ and any 12-character piece of an encoded form. A hint (the first 8 and last 4 ch
 allowed only for a value the test marks provider-issued, since `keys` prints one only for keys a
 provider issued, as the provider's console does.
 
+### `keys install-key`, `keys gh` and `keys git-credential`
+
+Agents sign in to GitHub as an App instead of the owner's own login (design: the auditor's
+`practices/key-rotation.md` § _Agents sign in as an App_).
+
+- `keys install-key <name>` copies a `github-app-key` credential's private key and client id from
+  1Password into one login-keychain item (`keys:<name>`), through `security -i` on stdin, so
+  minting never asks for Touch ID. It then signs in as the App once to prove the key.
+- `keys gh [--app NAME] -- <gh args>` mints a one-hour installation token for the call's owner
+  (from `-R`, `--repo=`, `$GH_REPO`, a github.com URL, a `gh api` path, the current repo's
+  `origin`, else `$KEYS_GH_DEFAULT_OWNER`), runs the real `gh` with it as `GH_TOKEN` in gh's
+  environment only (dropping `GITHUB_TOKEN` and `GITHUB_PERSONAL_ACCESS_TOKEN`), and revokes it
+  when gh ends. `gh auth token|login|refresh|switch` are refused. The real `gh` is
+  `$KEYS_REAL_GH`, else the first `gh` on `PATH` that is not a shim calling `keys gh`.
+- `keys git-credential [--app NAME] get` answers git's credential protocol for
+  `https://github.com` with `credential.useHttpPath` on, picking the path's owner; it refuses a
+  terminal, and leaves other hosts to the next helper.
+- An owner with no installation fails with a message naming it: nothing falls back to the
+  owner's sign-in. The App is named by `--app` or `$KEYS_GH_APP`.
+
 ## What is next
 
 Phase 2, from the design:
