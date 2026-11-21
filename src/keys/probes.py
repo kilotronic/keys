@@ -30,12 +30,11 @@ from collections.abc import Callable
 from email.utils import formatdate
 from typing import Any, cast
 
-from keys import forms
+from keys import forms, looks
 from keys.context import UsageError
 from keys.secret import Secret
 
 WORKS, DEAD, UNKNOWN = "WORKS", "DEAD", "UNKNOWN"
-CODE = re.compile(r"^[A-Za-z0-9_.:-]{1,60}$")
 
 
 @dataclasses.dataclass
@@ -421,7 +420,7 @@ def check(provider: Provider, key: Secret, opts: Options, sender: Sender) -> tup
         kind = kind if re.match(r"^[A-Za-z]{1,40}$", kind) else "network error"
         return UNKNOWN, f"no answer from {where} ({kind})"
     raw_code = error_code(answer.body)
-    code = _shown(raw_code, key) if CODE.match(raw_code) else ""
+    code = _shown(raw_code, key) if looks.plain_code(raw_code) else ""
     reason = f"HTTP {answer.status} from {where}" + (f" ({code})" if code else "")
     # Adobe answers invalid_client both for a dead secret and for a client ID it doesn't
     # know; only its (fixed, key-free) message tells them apart.

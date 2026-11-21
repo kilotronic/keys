@@ -36,12 +36,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+from keys import looks
 from keys.kinds import KINDS, VALUE_FIELD
 
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 FP = re.compile(r"^[0-9a-f]{8}$")
 LABEL = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_ .-]{0,63}$")
-SAFE_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,31}$")
 ITEM = re.compile(r"^op://([^/]+)/([^/]+)$")
 
 TOP_FIELDS = {"credential", "kept_budget"}
@@ -126,7 +126,7 @@ def _distance(a: str, b: str) -> int:
 def _unknown(where: str, key: str, known: Iterable[str]) -> str:
     # A value pasted as a key would be printed back, and many keys look like field names; so
     # name the key only when it is a near miss of a real field (a typo).
-    near = SAFE_KEY.fullmatch(key) and any(_distance(key, k) <= 2 for k in known)
+    near = looks.plain_key(key) and any(_distance(key, k) <= 2 for k in known)
     return f"{where}: unknown field {key}" if near else f"{where}: an unknown field"
 
 
@@ -182,7 +182,7 @@ def _target(where: str, raw: object, problems: list[str]) -> Target | None:
             problems.append(f"{where}.verify: must be a table")
         else:
             for k, v in cast(dict[str, object], t["verify"]).items():
-                if not SAFE_KEY.fullmatch(k):
+                if not looks.plain_key(k):
                     problems.append(f"{where}.verify: a key that is not a plain name")
                 elif isinstance(v, str):
                     verify[k] = v
@@ -206,6 +206,10 @@ def _credential(
         problems.append(f"{where}.name: missing")
     elif not isinstance(name, str) or not NAME.fullmatch(name):
         problems.append(f"{where}.name: must be lower-case letters, digits and dashes")
+        name = None
+    elif looks.name_looks_like_value(name):
+        # Never repeated back: a value pasted as a name would be printed in every error.
+        problems.append(f"{where}.name: looks like a value; give it a short descriptive name")
         name = None
     else:
         where = f"{where} ({name})"

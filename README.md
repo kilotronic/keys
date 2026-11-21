@@ -143,6 +143,30 @@ next: paste the value into its credential field in the 1Password app (never a te
 
 Kinds: `github-app-key`, `github-pat`, `railway-project-token`, `cloudflare-token`, `generic`.
 
+## Does this text look like a value?
+
+One module, `keys.looks`, answers it for every place keys might repeat text. Text looks like a
+value when it holds a control or unprintable character, a secret shape, a UUID, or a run of 24
+or more characters with no space that mixes letters and digits. In a link the host is exempt,
+but each piece of its path, query and fragment is held to the same rule.
+
+Where the places differ, and why:
+
+- **Credential names** (the mapping file and `keys new`) also fail when a dash-separated part is
+  longer than 16 characters. A name that looks like a value is refused and never repeated in an
+  error.
+- **Field names** in a mapping error are named only when they are a near miss of a real field
+  (a typo) and pass the rule whole. A `verify` key that mixes letters and digits for 24
+  characters, such as `header_x_api_key_v2_2024abc`, is refused.
+- **Error codes** from a service are shown only when they are 60 plain characters or fewer and
+  pass the rule.
+- **File names** in a scan finding are split on `-`, `_` and `.`, and the long-run rule applies
+  to each piece. Paths are built from words, dates, UUIDs and commit ids, so a UUID or a
+  40-digit commit id counts as plain there, and so does macOS's random per-user temp folder
+  (`/var/folders/<xx>/<folder>/`). Without that, every Claude transcript name would be withheld
+  and there would be nothing to pass to `keys scrub`. Secret shapes and control characters are
+  still withheld, and so is any name holding a known value.
+
 ## The canary tests
 
 Every command's tests run through one harness, `tests/canary.py`. It plants a made-up value in
@@ -185,9 +209,6 @@ Phase 2, from the design:
   `twilio-key`, `azure-app-secret`, and `generated` (a random signing secret, with `mint`).
 - Probes for Railway, Resend and Twilio, and the old checker's Key Vault and gitleaks-report
   sources, so the old scripts can become thin shims and then be deleted.
-- One shared "does this text look like a value?" test. Today the same question is answered
-  in four places (unknown mapping keys, `keys new`'s flag checks, scan's file names and
-  patterns, and check's error-code filter), each a little differently.
 - The schedules: the nightly CI run with an issue from day 120, and a daily launchd `keys scan`
   on the Mac.
 - A check, once, that `op item create` keeps the empty non-secret fields `keys new` asks for

@@ -30,7 +30,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
-from keys import forms, listing
+from keys import forms, listing, looks
 from keys.context import EXIT_FAIL, EXIT_OK, EXIT_UNKNOWN, Context, UsageError
 from keys.op import Op, OpError
 from keys.secret import Secret
@@ -80,30 +80,13 @@ SKIP_NAMES = {
 SKIP_UNDER_HOME = [".cursor/extensions"]
 
 
-def _rule(pattern: str, flags: int = 0) -> re.Pattern[bytes]:
-    return re.compile(pattern.encode(), flags)
-
-
-# Secret shapes. Each matches a whole token; what it matched is never shown.
-PATTERNS: dict[str, re.Pattern[bytes]] = {
-    "github-token": _rule(r"\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{60,255})"),
-    "anthropic-key": _rule(r"\bsk-ant-[a-z]{3,6}\d{2}-[A-Za-z0-9_-]{40,}"),
-    "openai-key": _rule(r"\bsk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{40,}"),
-    "slack-token": _rule(r"\bxox[abposr]-[A-Za-z0-9-]{10,}"),
-    "slack-webhook": _rule(
-        r"https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+"
-    ),
-    "aws-access-key": _rule(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
-    "google-api-key": _rule(r"\bAIza[0-9A-Za-z_-]{35}"),
-    "private-key": _rule(r"-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----"),
-    "1password-service-account": _rule(r"\bops_eyJ[A-Za-z0-9_-]{40,}"),
-    "stripe-key": _rule(r"\b[sr]k_live_[A-Za-z0-9]{20,}"),
-}
+# Secret shapes, from the one place keys keeps them.
+PATTERNS = looks.SHAPES
 # What scrub removes for a shape whose match is only its start: the whole block.
 SCRUB_PATTERNS: dict[str, re.Pattern[bytes]] = {
     **PATTERNS,
-    "private-key": _rule(
-        r"-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----.*?-----END (?:[A-Z]+ )*PRIVATE KEY-----",
+    "private-key": re.compile(
+        rb"-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----.*?-----END (?:[A-Z]+ )*PRIVATE KEY-----",
         re.DOTALL,
     ),
 }
@@ -311,20 +294,30 @@ def scan_roots(args: argparse.Namespace, ctx: Context) -> list[Path]:
     return unique
 
 
-def _clean(part: str) -> str:
-    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in part)
+def _macos_temp(parts: tuple[str, ...]) -> set[int]:
+    """The index of each random folder in a macOS /var/folders/<xx>/<random>/ temp path. It is
+    the system's per-user folder name, shown so the owner can find the file."""
+    return {
+        i + 3
+        for i in range(len(parts) - 3)
+        if parts[i : i + 2] == ("var", "folders") and len(parts[i + 2]) == 2
+    }
 
 
 def shown(path: Path, home: Path, s: Searcher | None = None) -> str:
-    """path for printing: under ~/ when it can be, control characters escaped, and any part
-    that holds a value or a secret shape withheld."""
+    """path for printing: under ~/ when it can be, and any part that holds a known value, or
+    looks like one (keys.looks; a control character among them), withheld."""
     try:
         parts, prefix = path.relative_to(home).parts, "~/"
     except ValueError:
         parts, prefix = path.parts, ""
+    temp = _macos_temp(parts)
     out = [
-        "<name withheld>" if s is not None and s.holds(os.fsencode(part)) else _clean(part)
-        for part in parts
+        "<name withheld>"
+        if (s is not None and s.holds(os.fsencode(part)))
+        or looks.file_name_looks_like_value(part, random_ok=i in temp)
+        else part
+        for i, part in enumerate(parts)
     ]
     text = "/".join(out)
     return prefix + text if prefix else ("/" + text.lstrip("/") if path.is_absolute() else text)
