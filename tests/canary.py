@@ -302,6 +302,13 @@ class Canary:
         self.db["list_fail"] = {"code": code, "stderr": f"[ERROR] {self.value}"}
         self._save_db()
 
+    def child_prints(self, words: list[str], stdout: str) -> None:
+        """A fake child whose program and leading words are these prints stdout and exits 0
+        (an answer keys cannot read)."""
+        self._load_db()
+        self.db.setdefault("child_print", []).append({"words": words, "stdout": stdout})
+        self._save_db()
+
     def child_fails(self, words: list[str], code: int = 1) -> None:
         """A fake child whose program and leading words are these fails with code; its error
         text holds the canary."""

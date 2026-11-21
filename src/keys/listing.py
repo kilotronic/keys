@@ -110,7 +110,12 @@ def _cell(value: object) -> str:
 
 
 def run(args: argparse.Namespace, ctx: Context) -> int:
-    m = load(args, ctx)
+    return EXIT_FAIL if report(load(args, ctx), ctx) else EXIT_OK
+
+
+def report(m: mapping.Mapping, ctx: Context) -> int:
+    """Print the table and its summary; return how many problems it found (a credential with
+    problems counts once, as do going over the budget and an empty file)."""
     today = ctx.today()
     rows = [assess(c, today) for c in m.credentials]
     table = [["NAME", "KIND", "FP", "EXPIRES", "LEFT", "LIFETIME", "NOTES"]]
@@ -146,4 +151,4 @@ def run(args: argparse.Namespace, ctx: Context) -> int:
         summary = "no credentials in the mapping file: an empty or cut-short file is a problem"
     ctx.say("")
     ctx.say(summary)
-    return EXIT_FAIL if failing or over_budget or not rows else EXIT_OK
+    return failing + int(over_budget) + int(not rows)

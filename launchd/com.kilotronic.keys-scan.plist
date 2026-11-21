@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  keys scan, once a day, on the owner's Mac. Install and remove: see the README (The daily scan),
+  which fills in OWNER and the mapping path with one sed command. launchd expands no shell
+  variables and reads no shell profile, so every path here is absolute and PATH is set.
+  The log holds only what keys scan prints: file names, line numbers, rule or credential names
+  and counts, never a value. Patterns only by default, so a scheduled run never asks for
+  Touch ID; the README says how to add the 1Password pass.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.kilotronic.keys-scan</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/OWNER/.local/bin/keys</string>
+    <string>scan</string>
+    <string>--patterns-only</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/OWNER/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>KEYS_MAPPING</key>
+    <string>/Users/OWNER/MAPPING</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>9</integer>
+    <key>Minute</key>
+    <integer>15</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/OWNER/Library/Logs/keys/scan.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/OWNER/Library/Logs/keys/scan.log</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+</dict>
+</plist>

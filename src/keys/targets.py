@@ -107,6 +107,9 @@ class Present:
     name: str
     updated_at: str = ""  # ISO 8601 when the store says
     fp: str = ""  # the keyed fingerprint tag or label keys wrote, when there is one
+    enabled: bool = True  # Key Vault: a disabled secret serves nothing
+    expires: str = ""  # Key Vault: ISO 8601 when the store says
+    managed: bool = False  # Key Vault: backs a certificate; not a credential keys maps
 
 
 def check_fields(where: str, t: mapping.Target) -> None:
@@ -178,7 +181,9 @@ class Adapter:
         try:
             return json.loads(out or "null")
         except ValueError:
-            raise TargetError(f"{self.program} printed something keys cannot read {what}") from None
+            pass
+        # Raised outside the handler, so no chained error carries any of the text.
+        raise TargetError(f"{self.program} printed something keys cannot read {what}")
 
 
 class _GitHub(Adapter):
@@ -278,6 +283,15 @@ class Railway(Adapter):
         del rows
         return {n: Present(n) for n in names}
 
+    def read(self) -> Secret | None:
+        """This variable's value, read in process (keys check --deep); None when it is not set.
+        The other variables' values in the same listing are dropped at once."""
+        argv = ["railway", "variable", "list", *self._scope_flags(), "--json"]
+        rows = self._json("listing variables", self._run("listing variables", argv))
+        found = cast(dict[str, Any], rows).get(self.name) if isinstance(rows, dict) else None
+        del rows
+        return Secret(found) if isinstance(found, str) else None
+
     def _latest(self) -> tuple[str, str]:
         argv = ["railway", "deployment", "list", *self._scope_flags(), "--json"]
         rows = self._json("listing deployments", self._run("listing deployments", argv))
@@ -335,7 +349,14 @@ class AzureKeyVault(Adapter):
             name = str(r.get("name") or str(r.get("id", "")).rsplit("/", 1)[-1])
             tags = cast(dict[str, Any], r.get("tags") or {})
             attrs = cast(dict[str, Any], r.get("attributes") or {})
-            out[name] = Present(name, str(attrs.get("updated") or ""), _fp(tags.get(FP_TAG)))
+            out[name] = Present(
+                name,
+                str(attrs.get("updated") or ""),
+                _fp(tags.get(FP_TAG)),
+                enabled=attrs.get("enabled") is not False,
+                expires=str(attrs.get("expires") or ""),
+                managed=bool(r.get("managed")),
+            )
         return out
 
 

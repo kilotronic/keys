@@ -44,7 +44,8 @@ FP = re.compile(r"^[0-9a-f]{8}$")
 LABEL = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_ .-]{0,63}$")
 ITEM = re.compile(r"^op://([^/]+)/([^/]+)$")
 
-TOP_FIELDS = {"credential", "kept_budget"}
+TOP_FIELDS = {"credential", "kept_budget", "ignore_unmapped"}
+SECRET_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,254}$")
 CREDENTIAL_FIELDS = {
     "name",
     "kind",
@@ -112,6 +113,8 @@ class Mapping:
     path: Path
     credentials: list[Credential]
     kept_budget: int | None = None
+    # Secret names at a mapped scope that are not credentials (keys check --all names the rest).
+    ignore_unmapped: tuple[str, ...] = ()
 
 
 def _distance(a: str, b: str) -> int:
@@ -294,6 +297,16 @@ def parse(doc: AnyMapping[str, Any], path: Path) -> Mapping:
     if budget is not None and (type(budget) is not int or budget < 0):
         problems.append("kept_budget: must be a whole number, 0 or more")
         budget = None
+    ignore: list[str] = []
+    raw_ignore: object = doc.get("ignore_unmapped", [])
+    items = cast(list[object], raw_ignore) if isinstance(raw_ignore, list) else None
+    if items is None or not all(
+        isinstance(n, str) and SECRET_NAME.fullmatch(n) and not looks.looks_like_value(n)
+        for n in items
+    ):
+        problems.append("ignore_unmapped: must be a list of secret names")
+    else:
+        ignore = [cast(str, n) for n in items]
     raw: object = doc.get("credential", [])
     credentials: list[Credential] = []
     if not isinstance(raw, list):
@@ -306,7 +319,7 @@ def parse(doc: AnyMapping[str, Any], path: Path) -> Mapping:
                 credentials.append(c)
     if problems:
         raise MappingError(problems)
-    return Mapping(path, credentials, budget)
+    return Mapping(path, credentials, budget, tuple(ignore))
 
 
 def load(path: Path, shown: str | None = None) -> Mapping:

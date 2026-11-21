@@ -106,6 +106,10 @@ def main(prog: str, argv: list[str]) -> int:
         _log({"id": me, "stdin": stdin})
     with open(os.environ["KEYS_FAKE_DB"], encoding="utf-8") as f:
         db: dict[str, Any] = json.load(f)
+    for odd in db.get("child_print", []):
+        if [prog, *words][: len(odd["words"])] == odd["words"]:
+            print(odd["stdout"])
+            return 0
     for fail in db.get("child_fail", []):
         if [prog, *words][: len(fail["words"])] == fail["words"]:
             print(fail.get("stderr", ""), file=sys.stderr)
@@ -137,7 +141,9 @@ def main(prog: str, argv: list[str]) -> int:
             print(lfail["stderr"], file=sys.stderr)
             return int(lfail["code"])
         vault = flags.get("--vault")
+        tag = flags.get("--tags")
         items = [i for i in db["items"] if vault is None or i["vault"]["name"] == vault]
+        items = [i for i in items if tag is None or tag in i.get("tags", [])]
         print(json.dumps(items))
         return 0
     if words[:2] == ["item", "create"]:
@@ -264,7 +270,12 @@ def targets(
                 "id": f"https://{vault}.vault.azure.net/secrets/{n}",
                 "name": n,
                 "tags": v.get("tags", {}),
-                "attributes": {"updated": v["updated_at"]},
+                "attributes": {
+                    "updated": v["updated_at"],
+                    "enabled": v.get("enabled", True),
+                    "expires": v.get("expires"),
+                },
+                "managed": v.get("managed"),
             }
             for n, v in _under(db, target_key("az", flags, "")).items()
         ]

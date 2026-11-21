@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 import re
 from pathlib import Path
 
@@ -239,3 +240,16 @@ def test_the_given_path_is_never_printed(tmp_path: Path) -> None:
     with pytest.raises(mapping.MappingError) as e:
         mapping.load(tmp_path / CANARY, shown="the mapping file named by --mapping")
     assert str(e.value) == "no mapping file at the mapping file named by --mapping"
+
+
+def test_ignore_unmapped_takes_plain_secret_names(tmp_path: Path) -> None:
+    m = load(tmp_path, 'ignore_unmapped = ["DATA_LEAK_DENYLIST"]\n' + GOOD)
+    assert m.ignore_unmapped == ("DATA_LEAK_DENYLIST",)
+
+
+@pytest.mark.parametrize("bad", ['"ONE"', "[1]", f"[{json.dumps(CANARY)}]", f'["{KEYLIKE}"]'])
+def test_ignore_unmapped_refuses_anything_else_without_repeating_it(
+    tmp_path: Path, bad: str
+) -> None:
+    message = errors(tmp_path, f"ignore_unmapped = {bad}\n" + GOOD)
+    assert "ignore_unmapped: must be a list of secret names" in message

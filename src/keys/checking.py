@@ -12,7 +12,7 @@ import argparse
 import json
 import re
 
-from keys import leaks, probes, proc
+from keys import leaks, listing, probes, proc
 from keys.context import EXIT_FAIL, EXIT_OK, EXIT_UNKNOWN, Context, UsageError
 from keys.fingerprint import fingerprint, hint
 from keys.op import Op, OpError
@@ -38,6 +38,17 @@ def configure(p: argparse.ArgumentParser) -> None:
         help="where the fingerprint secret comes from (default: $KEYS_FP_KEY), same forms",
     )
     p.add_argument("--expect", choices=["works", "dead"], help="exit 0 only for this verdict")
+    p.add_argument(
+        "--all",
+        action="store_true",
+        help="every credential in the mapping file at its targets, by name only (no 1Password)",
+    )
+    p.add_argument(
+        "--deep",
+        action="store_true",
+        help="--all, plus fingerprints of the real values and the 1Password items (on the Mac)",
+    )
+    listing.add_mapping_flag(p)
     for flag in ("--client-id", "--account", "--scm-host", "--user", "--url", "--query"):
         p.add_argument(flag)
     p.add_argument("--header", action="append", help="'Name: {key}' (http)")
@@ -146,6 +157,12 @@ def read_fp_key(flag: str | None, ctx: Context) -> Secret:
 
 
 def run(args: argparse.Namespace, ctx: Context) -> int:
+    if args.all or args.deep:
+        if args.service or args.key or args.list:
+            raise UsageError("keys check --all takes no service and no --key")
+        from keys import auditing  # auditing builds on this module's fingerprint-key reader
+
+        return auditing.run(args, ctx)
     if args.list:
         for p in probes.PROVIDERS.values():
             ctx.say(f"{p.name:20} {p.about}")
