@@ -114,6 +114,12 @@ def main(prog: str, argv: list[str]) -> int:
         if fail:
             print(fail["stderr"], file=sys.stderr)
             return int(fail["code"])
+        item = json.loads(stdin)
+        db["items"].append(
+            {"id": "made", "title": item["title"], "vault": {"name": flags.get("--vault")}}
+        )
+        with open(os.environ["KEYS_FAKE_DB"], "w", encoding="utf-8") as out:
+            json.dump(db, out)
         print(json.dumps({"id": "fakeitemid"}))
         return 0
     print("fake op: no answer for this call", file=sys.stderr)

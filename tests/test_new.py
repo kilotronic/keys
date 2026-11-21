@@ -104,7 +104,7 @@ def test_a_failed_create_prints_only_the_exit_code_and_writes_no_entry(canary: C
     [
         (["new", "no-such-kind", "a", *ARGS], "invalid choice"),
         (["new", "generic", "Bad Name", *ARGS], "name must be lower-case letters"),
-        (["new", "generic", CANARY, *ARGS], "name must be lower-case letters"),
+        (["new", "generic", CANARY, *ARGS], "the name"),
         (["new", "generic", "a", "--vault", "a/b", "--kept-because", "x"], "vault name"),
         (["new", "generic", "a", "--vault", "V"], "--kept-because"),
         (["new", "generic", "a", "--vault", "V", "--kept-because", "  "], "--kept-because"),
@@ -232,3 +232,97 @@ def test_a_mapping_that_cannot_be_written_is_reported_with_the_item_made(canary:
 def test_the_item_json_holds_nothing_planted(canary: Canary) -> None:
     canary.run(["new", "generic", "a", *ARGS])
     assert CANARY not in json.dumps(created(canary))
+
+
+# ---------------------------------------------------------------------------- second review
+
+UUIDISH = "3f2b9c1e-" + "8a4d-4e6f-9b0c-" + "7d5e1a2b3c4d"  # made up
+HEXISH = "9f8e7d6c5b4a" + "39281706f5e4d3c2"  # made up
+
+
+@pytest.mark.parametrize("name", [UUIDISH, HEXISH, "app-" + HEXISH])
+def test_a_name_shaped_like_a_value_is_refused(canary: Canary, name: str) -> None:
+    canary.watch(name)
+    result = canary.run(["new", "generic", name, *ARGS])
+    assert result.code == 3
+    assert not canary.children()
+
+
+def test_a_url_in_the_reason_is_fine(canary: Canary) -> None:
+    reason = "see https://example.com/org/repo/issues/123 for why"
+    result = canary.run(["new", "generic", "a", "--vault", "V", "--kept-because", reason])
+    assert result.code == 0, result.stderr
+
+
+def test_a_stale_temp_file_does_not_block_the_write(canary: Canary) -> None:
+    (canary.work / "keys.toml").write_text("")
+    (canary.work / ".keys.toml.keys-new").write_text("left from a crash")
+    result = canary.run(["new", "generic", "a", *ARGS])
+    assert result.code == 0, result.stderr
+    assert mapping(canary)["credential"][0]["name"] == "a"
+
+
+def test_an_edit_made_while_op_ran_is_not_lost(
+    canary: Canary, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from keys import op as op_module
+
+    path = canary.work / "keys.toml"
+    path.write_text("")
+    real = op_module.Op.item_create
+
+    def create_and_edit(self: op_module.Op, vault: str, item: dict[str, Any]) -> None:
+        real(self, vault, item)
+        path.write_text("# edited meanwhile\n")
+
+    monkeypatch.setattr(op_module.Op, "item_create", create_and_edit)
+    result = canary.run(["new", "generic", "a", *ARGS])
+    assert result.code == 3
+    assert "changed while" in result.stderr
+    assert "--entry-only" in result.stderr
+    assert path.read_text() == "# edited meanwhile\n"
+
+
+def test_a_symlinked_mapping_is_written_through(canary: Canary) -> None:
+    real = canary.work / "real.toml"
+    real.write_text("")
+    (canary.work / "keys.toml").symlink_to(real)
+    result = canary.run(["new", "generic", "a", *ARGS])
+    assert result.code == 0, result.stderr
+    assert (canary.work / "keys.toml").is_symlink()
+    assert '"a"' in real.read_text()
+
+
+def test_the_mapping_keeps_its_permissions(canary: Canary) -> None:
+    path = canary.work / "keys.toml"
+    path.write_text("")
+    path.chmod(0o664)
+    result = canary.run(["new", "generic", "a", *ARGS])
+    assert result.code == 0
+    assert path.stat().st_mode & 0o777 == 0o664
+
+
+def test_entry_only_uses_the_item_s_real_title(canary: Canary) -> None:
+    canary.op_items([{"id": "x", "title": "Generic A", "vault": {"name": "Automation"}}])
+    result = canary.run(["new", "generic", "a", *ARGS, "--entry-only"])
+    assert result.code == 0, result.stderr
+    assert mapping(canary)["credential"][0]["item"] == "op://Automation/Generic A"
+
+
+def test_made_the_item_then_the_write_failed_then_entry_only(canary: Canary) -> None:
+    (canary.work / "keys.toml").write_text("")
+    canary.work.chmod(0o500)
+    try:
+        first = canary.run(["new", "generic", "a", *ARGS])
+    finally:
+        canary.work.chmod(0o700)
+    assert first.code == 3
+    second = canary.run(["new", "generic", "a", *ARGS, "--entry-only"])
+    assert second.code == 0, second.stderr
+    assert mapping(canary)["credential"][0]["name"] == "a"
+
+
+def test_errors_do_not_repeat_the_vault(canary: Canary) -> None:
+    canary.op_items([{"id": "x", "title": "generic dup", "vault": {"name": "Automation"}}])
+    result = canary.run(["new", "generic", "dup", *ARGS])
+    assert "Automation" not in result.stderr

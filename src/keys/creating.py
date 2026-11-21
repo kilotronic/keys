@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import re
+import tempfile
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -68,6 +69,9 @@ def item_json(kind: str, name: str) -> dict[str, Any]:
 
 OWNER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@-]{0,63}")
 LONG_RUN = re.compile(r"[^\s]{24,}")
+URL = re.compile(r"https?://[A-Za-z0-9.-]+(?:/[A-Za-z0-9._~%/-]*)?(?:#[A-Za-z0-9_-]*)?")
+NAME_PART = 16
+UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
 def _refuse_value(flag: str, text: str) -> None:
@@ -75,7 +79,7 @@ def _refuse_value(flag: str, text: str) -> None:
     value pasted into the wrong flag. The text is never repeated back."""
     if any(not c.isprintable() for c in text) or any(0xD800 <= ord(c) <= 0xDFFF for c in text):
         raise UsageError(f"{flag} holds a control or unprintable character")
-    for run in LONG_RUN.findall(text):
+    for run in LONG_RUN.findall(URL.sub(" ", text)):  # a plain link is not a key
         if any(c.isalpha() for c in run) and any(c.isdigit() for c in run):
             raise UsageError(f"{flag} holds something shaped like a key; nothing was made")
     if any(p.search(text.encode()) for p in PATTERNS.values()):
@@ -88,6 +92,9 @@ def run(args: argparse.Namespace, ctx: Context) -> int:
     vault: str = args.vault
     reason: str = args.kept_because
     owner: str | None = args.owner
+    _refuse_value("the name", name)
+    if any(len(part) > NAME_PART for part in name.split("-")) or UUID.search(name):
+        raise UsageError("the name looks like a value; give it a short descriptive name")
     if not mapping.NAME.fullmatch(name):
         raise UsageError("the name must be lower-case letters, digits and dashes")
     _refuse_value("--vault", vault)
@@ -102,15 +109,15 @@ def run(args: argparse.Namespace, ctx: Context) -> int:
             raise UsageError("--owner takes a handle: letters, digits, . _ @ -")
 
     path, shown = listing.mapping_path(args, ctx)
+    path = path.resolve() if path.is_symlink() else path  # write through a link, not over it
     title = f"{kind} {name}"
-    ref = f"op://{vault}/{title}"
     if path.exists():
         before = path.read_text(encoding="utf-8")
         existing = mapping.load(path, shown)
         for c in existing.credentials:
             if c.name == name:
                 raise UsageError(f"{name} is already in the mapping file")
-            if c.item.casefold() == ref.casefold():
+            if c.item.casefold() == f"op://{vault}/{title}".casefold():
                 raise UsageError(f"{c.name} already uses that item")
     elif args.mapping or ctx.environ.get("KEYS_MAPPING"):
         # Only ./keys.toml is ever created: a path given by flag or environment could be a value.
@@ -118,27 +125,29 @@ def run(args: argparse.Namespace, ctx: Context) -> int:
     else:
         before = ""
 
-    entry = ["[[credential]]", f"name = {_toml(name)}", f"kind = {_toml(kind)}"]
-    entry.append(f"item = {_toml(ref)}")
-    if owner:
-        entry.append(f"owner = {_toml(owner)}")
-    entry.append(f"kept_because = {_toml(reason)}")
-    text = before + ("" if not before or before.endswith("\n") else "\n")
-    text += ("\n" if before else "") + "\n".join(entry) + "\n"
+    def new_text(item_title: str) -> str:
+        entry = ["[[credential]]", f"name = {_toml(name)}", f"kind = {_toml(kind)}"]
+        entry.append(f"item = {_toml(f'op://{vault}/{item_title}')}")
+        if owner:
+            entry.append(f"owner = {_toml(owner)}")
+        entry.append(f"kept_because = {_toml(reason)}")
+        text = before + ("" if not before or before.endswith("\n") else "\n")
+        return text + ("\n" if before else "") + "\n".join(entry) + "\n"
+
     try:
-        mapping.parse(tomllib.loads(text), path)  # what will be written must load, before op
+        mapping.parse(tomllib.loads(new_text(title)), path)  # it must load, before op is touched
     except (tomllib.TOMLDecodeError, mapping.MappingError):
         raise UsageError("the new mapping entry would not load; nothing was made") from None
 
     op = Op(ctx.environ)
     try:
-        titles = {t.casefold() for t in op.item_titles(vault)}
-        exists = title.casefold() in titles
-        if args.entry_only and not exists:
-            raise UsageError(f"the vault {vault} has no item named {title}")
+        found = {t.casefold(): t for t in op.item_titles(vault)}
+        real_title = found.get(title.casefold())
+        if args.entry_only and real_title is None:
+            raise UsageError(f"that vault has no item named {title}")
         if not args.entry_only:
-            if exists:
-                raise UsageError(f"the vault {vault} already has an item named {title}")
+            if real_title is not None:
+                raise UsageError(f"that vault already has an item named {title}")
             try:
                 op.item_create(vault, item_json(kind, name))
             except OpError as e:
@@ -148,10 +157,18 @@ def run(args: argparse.Namespace, ctx: Context) -> int:
                         "its mapping entry"
                     ) from None
                 raise
+            real_title = title
     except OpError as e:
         raise UsageError(str(e)) from None
+    text = new_text(real_title or title)
 
     made = "found" if args.entry_only else "made"
+    now = path.read_text(encoding="utf-8") if path.exists() else ""
+    if now != before:
+        raise UsageError(
+            f"{made} the 1Password item {title}, but the mapping file changed while 1Password "
+            "was asked; rerun with --entry-only to add its entry"
+        )
     try:
         _replace(path, text)
     except OSError as e:
@@ -169,15 +186,22 @@ def run(args: argparse.Namespace, ctx: Context) -> int:
 
 
 def _replace(path: Path, text: str) -> None:
-    """The mapping file, replaced whole: written beside it, then moved over it."""
+    """The mapping file, replaced whole: written beside it under a fresh name, then moved over
+    it, keeping its permissions, and the folder synced so the move survives a power cut."""
     mode = path.stat().st_mode & 0o777 if path.exists() else 0o644
-    tmp = path.with_name(f".{path.name}.keys-new")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".keys-new")
+    tmp = Path(name)
     try:
+        os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
+        folder = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(folder)
+        finally:
+            os.close(folder)
     finally:
         tmp.unlink(missing_ok=True)
