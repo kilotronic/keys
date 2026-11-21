@@ -42,6 +42,9 @@ class Answer:
     status: int  # 0 when no answer came back
     body: str
     error: str = ""  # the network error's type, when status is 0
+    # Response headers, names in lower case. Read only for fixed, key-free ones (a token's
+    # expiry date).
+    headers: dict[str, str] = dataclasses.field(default_factory=lambda: dict[str, str]())
 
 
 Request = tuple[str, str, dict[str, str], bytes | None]
@@ -73,6 +76,16 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+READ_LIMIT = 1 << 16  # a token's policies can run past a few kB
+
+
+def _headers(raw: Any) -> dict[str, str]:
+    try:
+        return {str(k).lower(): str(v) for k, v in raw.items()}
+    except AttributeError:
+        return {}
+
+
 def send(method: str, url: str, headers: dict[str, str], data: bytes | None = None) -> Answer:
     handlers: list[urllib.request.BaseHandler] = [_NoRedirect()]
     if _local(urllib.parse.urlsplit(url).hostname or ""):
@@ -83,9 +96,11 @@ def send(method: str, url: str, headers: dict[str, str], data: bytes | None = No
             url, data=data, method=method, headers={"User-Agent": "keys-check", **headers}
         )
         with opener.open(req, timeout=30) as resp:
-            return Answer(resp.status, resp.read(4096).decode(errors="replace"))
+            body = resp.read(READ_LIMIT).decode(errors="replace")
+            return Answer(resp.status, body, headers=_headers(resp.headers))
     except urllib.error.HTTPError as e:
-        return Answer(e.code, e.read(4096).decode(errors="replace"))
+        body = e.read(READ_LIMIT).decode(errors="replace")
+        return Answer(e.code, body, headers=_headers(e.headers))
     except urllib.error.URLError as e:
         reason = e.reason
         return Answer(
@@ -106,6 +121,8 @@ def error_code(body: str) -> str:
     if not isinstance(doc, dict):
         return ""
     d = cast(dict[str, Any], doc)
+    if isinstance(d.get("statusCode"), int) and isinstance(d.get("name"), str):
+        return str(d["name"])  # Resend: {"statusCode": 401, "name": "restricted_api_key"}
     err = d.get("error")
     if isinstance(err, dict):
         e = cast(dict[str, Any], err)
@@ -133,6 +150,8 @@ class Provider:
     needs: tuple[str, ...] = ()
     shown_url: str = ""  # what the result names; the real URL can hold the key (SerpApi)
     hint: bool = True  # the provider issued the key, so its console shows this hint
+    # A verdict that needs the status and the code together; None falls through to the rest.
+    verdict: Callable[[int, str], str | None] | None = None
 
 
 def _form(fields: dict[str, str]) -> bytes:
@@ -282,6 +301,15 @@ PROVIDERS: dict[str, Provider] = {
             {401},
         ),
         Provider(
+            "resend",
+            "Resend API key: lists domains (a sending-only key is told it is restricted, which "
+            "means it works)",
+            _bearer("https://api.resend.com/domains"),
+            {200},
+            set(),
+            verdict=lambda status, code: _resend_verdict(status, code),
+        ),
+        Provider(
             "serpapi",
             "SerpApi key: reads the account (no search is spent)",
             lambda k, o: (
@@ -397,8 +425,29 @@ def _shown(text: str, key: Secret) -> str:
     return "" if forms.holds_piece(text, key) else text
 
 
+def _resend_verdict(status: int, code: str) -> str | None:
+    """Resend's errors page: 401 restricted_api_key is a sending-only key, so it works; 400 or
+    401 validation_error is an unknown or deleted key; 403 restricted_api_key is an inactive
+    one and suspended_api_key a suspended one. missing_api_key says nothing about the key."""
+    if status == 401 and code == "restricted_api_key":
+        return WORKS
+    if (status in (400, 401) and code == "validation_error") or (
+        status == 403 and code in ("restricted_api_key", "suspended_api_key")
+    ):
+        return DEAD
+    return None
+
+
 def check(provider: Provider, key: Secret, opts: Options, sender: Sender) -> tuple[str, str]:
     """(verdict, reason). The reason names host, path, status and error code; never the key."""
+    verdict, reason, _ = check_answer(provider, key, opts, sender)
+    return verdict, reason
+
+
+def check_answer(
+    provider: Provider, key: Secret, opts: Options, sender: Sender
+) -> tuple[str, str, Answer]:
+    """check, and the answer itself, for a caller that reads a fixed header from it."""
     for need in provider.needs:
         if not getattr(opts, need, None):
             raise UsageError(f"{provider.name} needs --{need.replace('_', '-')}")
@@ -418,29 +467,34 @@ def check(provider: Provider, key: Secret, opts: Options, sender: Sender) -> tup
     if answer.status == 0:
         kind = answer.error.split(":", 1)[0].strip()
         kind = kind if re.match(r"^[A-Za-z]{1,40}$", kind) else "network error"
-        return UNKNOWN, f"no answer from {where} ({kind})"
+        return UNKNOWN, f"no answer from {where} ({kind})", answer
     raw_code = error_code(answer.body)
     code = _shown(raw_code, key) if looks.plain_code(raw_code) else ""
     reason = f"HTTP {answer.status} from {where}" + (f" ({code})" if code else "")
     # Adobe answers invalid_client both for a dead secret and for a client ID it doesn't
     # know; only its (fixed, key-free) message tells them apart.
     if provider.name == "adobe" and "invalid client_id" in answer.body:
-        return UNKNOWN, reason + ": Adobe does not know this client ID; check --client-id"
+        return UNKNOWN, reason + ": Adobe does not know this client ID; check --client-id", answer
     if provider.name == "cloudflare" and answer.status == 200:
         # Cloudflare answers 200 for a disabled or expired token too; its status says which.
         status = _cloudflare_status(answer.body)
         if not status:
-            return UNKNOWN, f"{reason}: no token status in the answer"
-        return (WORKS, reason) if status == "active" else (DEAD, f"{reason} ({status})")
+            return UNKNOWN, f"{reason}: no token status in the answer", answer
+        verdict = WORKS if status == "active" else DEAD
+        return verdict, reason if status == "active" else f"{reason} ({status})", answer
+    if provider.verdict is not None:
+        settled = provider.verdict(answer.status, raw_code)
+        if settled is not None:
+            return settled, reason, answer
     if raw_code in provider.works_codes:
-        return WORKS, reason
+        return WORKS, reason, answer
     if raw_code in provider.dead_codes:
-        return DEAD, reason
+        return DEAD, reason, answer
     if answer.status in works:
-        return WORKS, reason
+        return WORKS, reason, answer
     if answer.status in dead:
-        return DEAD, reason
-    return UNKNOWN, reason
+        return DEAD, reason, answer
+    return UNKNOWN, reason, answer
 
 
 def _cloudflare_status(body: str) -> str:

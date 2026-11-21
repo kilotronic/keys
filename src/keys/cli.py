@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, NoReturn
 if TYPE_CHECKING:
     from _typeshed import SupportsWrite
 
-from keys import checking, creating, fpcmd, listing, scanning, syncing
+from keys import checking, creating, fpcmd, listing, rotating, scanning, syncing
 from keys.context import (
     EXIT_INTERNAL,
     EXIT_OK,
@@ -69,7 +69,9 @@ def _parser(ctx: Context, argv: Sequence[str]) -> _Parser:
 
     top = make(
         prog="keys",
-        description="Credentials without their values: list, check, scan, scrub, create and sync.",
+        description=(
+            "Credentials without their values: list, check, scan, scrub, create, sync and rotate."
+        ),
     )
     sub = top.add_subparsers(dest="command", metavar="<command>", parser_class=_Parser)
 
@@ -98,6 +100,7 @@ def _parser(ctx: Context, argv: Sequence[str]) -> _Parser:
     fpcmd.configure_leaks(
         add("leaks", "each leaked value in a gitleaks report, by fingerprint, never the value")
     )
+    rotating.configure(add("rotate", "replace a credential end to end: make, store, sync, revoke"))
     return top
 
 
@@ -122,6 +125,8 @@ def run(argv: Sequence[str], ctx: Context) -> int:
         return fpcmd.fp(args, ctx)
     if command == "leaks":
         return fpcmd.report(args, ctx)
+    if command == "rotate":
+        return rotating.run(args, ctx)
     raise UsageError(f"keys {command} is not built yet")
 
 

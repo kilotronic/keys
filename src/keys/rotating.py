@@ -1,0 +1,781 @@
+"""keys rotate <name>: replace a credential end to end, in the design's eight steps.
+
+    1 preflight  the mapping parses, every target can be reached, each GitHub Environment
+                 admits main only, the 1Password item (and the minting key) can be read
+    2 create     mint the new key and save it at once in the item's `pending` field; or, with no
+                 create API, open the provider's pre-filled page and the item, and wait for the
+                 owner's paste into `pending` (rerun to continue)
+    3 probe      the new key must work (and, where the provider says, expire within 180 days)
+    4 store      the current key moves to `previous`, the new one to the main field
+    5 sync       to every target, on each CLI's stdin
+    6 verify     each target uses it: a GitHub secret's date moved and its workflow passes,
+                 Railway redeployed, Key Vault and Secret Manager carry its fingerprint
+    7 revoke     the old key, by API or on the provider's page (rerun after the click), then
+                 probe it and expect it dead
+    8 record     fp, rotated and expires in the mapping file; `previous` cleared
+
+Where it stands lives in the item's `keys_step` field, so a rerun resumes where the last run
+stopped. Until step 7 the old key still works: a failure in steps 5 or 6 puts it back at every
+target already changed and in 1Password, and revokes the new one. After step 7 nothing is
+rolled back. Every line names the credential, the step, the target and fingerprints; never a
+value, and never a program's or a provider's own text.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import re
+import tomllib
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any, cast
+
+from keys import files, listing, looks, mapping, probes, proc, rotators, targets
+from keys.checking import fp_key_variable, read_fp_key
+from keys.context import EXIT_FAIL, EXIT_OK, EXIT_WAITING, Context, UsageError
+from keys.fingerprint import fingerprint
+from keys.kinds import KINDS
+from keys.op import Op, OpError, fields, set_fields
+from keys.secret import Secret
+
+STEP = "keys_step"  # where a rotation stands, kept in the item (not secret)
+EXPIRES = "keys_expires"  # the new key's expiry, from the provider, until it is recorded
+PENDING, PREVIOUS = "pending", "previous"
+PENDING_ID, PREVIOUS_ID = "pending_id", "previous_id"
+AWAITING, CREATED, STORED, VERIFIED, REVOKED = (
+    "awaiting-paste",
+    "pending",
+    "stored",
+    "verified",
+    "revoked",
+)
+STEPS = dict(
+    enumerate(["preflight", "create", "probe", "store", "sync", "verify", "revoke", "record"], 1)
+)
+PROBE_TRIES = 3  # a fresh key can take a few seconds to authenticate
+PROBE_WAIT_S = 5
+RUN_LOOKS = 6  # looks for the run a dispatch started
+WATCH_TIMEOUT_S = 3600
+WORKFLOW = re.compile(r"[A-Za-z0-9_.-]{1,100}\.ya?ml")
+PLAIN_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+class StepError(Exception):
+    """A step failed; the message names it and what was left, never a value."""
+
+    def __init__(self, step: int, text: str) -> None:
+        super().__init__(f"{step} {STEPS[step]}: {text}")
+
+
+def configure(p: argparse.ArgumentParser) -> None:
+    p.add_argument("name", help="the credential to rotate")
+    p.add_argument(
+        "--dry-run", action="store_true", help="check what can be checked and print the plan"
+    )
+    p.add_argument(
+        "--now",
+        action="store_true",
+        help="rotate a kind that keeps one key at a time, which means a short outage",
+    )
+    p.add_argument(
+        "--fp-key",
+        metavar="SOURCE",
+        help="where the fingerprint secret comes from (default: $KEYS_FP_KEY)",
+    )
+    listing.add_mapping_flag(p)
+
+
+def _find(m: mapping.Mapping, name: str, what: str) -> mapping.Credential:
+    for c in m.credentials:
+        if c.name == name:
+            return c
+    raise UsageError(f"no credential by that name in the mapping file ({what})")
+
+
+def run(args: argparse.Namespace, ctx: Context) -> int:
+    m = listing.load(args, ctx)
+    c = _find(m, args.name, "the name given")
+    rot = rotators.ROTATORS.get(c.kind)
+    if rot is None:
+        raise UsageError(f"keys cannot rotate a {c.kind} yet; it can rotate {_kinds()}")
+    if KINDS[c.kind].single_key and not args.now:
+        raise UsageError(
+            f"a {c.kind} has one key at a time, so rotating it means a short outage; rerun "
+            "with --now when that is fine"
+        )
+    minter: mapping.Credential | None = None
+    if rot.mints:
+        if not c.minted_by:
+            raise UsageError(f"{c.name}: set minted_by to the credential whose key mints it")
+        minter = _find(m, c.minted_by, "minted_by")
+        if minter.name == c.name:
+            raise UsageError(f"{c.name}: minted_by must name another credential")
+    hidden = fp_key_variable(args.fp_key, ctx)
+    environ = {k: v for k, v in ctx.environ.items() if k != hidden}
+    ads = targets.adapters(c, environ)  # every target field checked before anything runs
+    for i, a in enumerate(ads):
+        wf = a.target.verify.get("workflow")
+        if wf is not None:
+            if not isinstance(a, targets.GitHubRepo | targets.GitHubEnv):
+                raise UsageError(f"{c.name}.target[{i}].verify: a workflow needs a repo target")
+            if not WORKFLOW.fullmatch(wf) or looks.looks_like_value(wf.rsplit(".", 1)[0]):
+                raise UsageError(f"{c.name}.target[{i}].verify.workflow: a workflow file name")
+    r = Rotation(args, ctx, c, rot, minter, ads, environ)
+    try:
+        return r.dry_run() if args.dry_run else r.go()
+    except StepError as e:
+        ctx.warn(f"keys: {c.name}: {e}")
+        return EXIT_FAIL
+
+
+def _kinds() -> str:
+    return ", ".join(sorted(rotators.ROTATORS))
+
+
+class Rotation:
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        ctx: Context,
+        c: mapping.Credential,
+        rot: rotators.Rotator,
+        minter: mapping.Credential | None,
+        ads: list[targets.Adapter],
+        environ: Mapping[str, str],
+    ) -> None:
+        self.args, self.ctx, self.c, self.rot = args, ctx, c, rot
+        self.minter, self.ads, self.environ = minter, ads, environ
+        self.op = Op(environ)
+        self.today = ctx.today()
+        self.key_name = f"{c.name} {self.today.isoformat()}"
+        self.send: rotators.Send = ctx.send or probes.send
+        self.before: dict[tuple[str, ...], dict[str, targets.Present]] = {}
+        self.fp_key = Secret("")
+        self.minter_value = Secret("")
+        self.item: dict[str, Any] = {}
+
+    # ------------------------------------------------------------------ helpers
+
+    def say(self, step: int, text: str) -> None:
+        self.ctx.say(f"{self.c.name}: {step} {STEPS[step]}: {text}")
+
+    def fp(self, value: Secret) -> str:
+        return fingerprint(self.fp_key, value)
+
+    def api(self, *values: Secret) -> rotators.Api:
+        return rotators.Api(self.send, [self.minter_value, *values])
+
+    def fields(self) -> dict[str, str]:
+        return fields(self.item)
+
+    def save(self, step: int, values: dict[str, str], after: str = "") -> None:
+        """The item with these fields set, saved in one edit."""
+        set_fields(self.item, values, {self.c.field, PENDING, PREVIOUS})
+        try:
+            self.op.item_edit(self.c.vault, self.item)
+        except OpError as e:
+            raise StepError(step, f"{e}" + (f"; {after}" if after else "")) from None
+
+    def reload(self) -> None:
+        try:
+            self.item = self.op.item_get(self.c.vault, self.c.item_title)
+        except OpError as e:
+            raise UsageError(f"could not read {self.c.name}'s 1Password item: {e}") from None
+
+    def gh(self, step: int, what: str, argv: list[str], timeout: int = proc.TIMEOUT_S) -> str:
+        env = proc.child_env(self.environ, names=targets.ENV_NAMES["gh"])
+        try:
+            done = proc.run(argv, env, timeout=timeout)
+        except proc.ChildError as e:
+            raise StepError(step, str(e)) from None
+        if done.code != 0:
+            raise StepError(step, f"gh exited {done.code} {what}")
+        return done.stdout
+
+    def open(self, url: str, what: str) -> None:
+        """Open a page for the owner; with no `open` here, print where it is."""
+        env = proc.child_env(self.environ)
+        try:
+            done = proc.run(["open", url], env)
+            ok = done.code == 0
+        except proc.ChildError:
+            ok = False
+        if not ok:
+            self.ctx.say(f"open {what}: {url}")
+
+    def open_item(self) -> None:
+        item_id = str(self.item.get("id", ""))
+        vault = cast(dict[str, Any], self.item.get("vault") or {})
+        vault_id = str(vault.get("id", ""))
+        if PLAIN_ID.fullmatch(item_id) and PLAIN_ID.fullmatch(vault_id):
+            self.open(f"onepassword://view-item/?v={vault_id}&i={item_id}", "the 1Password item")
+
+    def probe(self, value: Secret) -> tuple[str, str, probes.Answer]:
+        provider = probes.PROVIDERS[self.rot.probe]
+        verdict, reason, answer = "", "", probes.Answer(0, "")
+        for attempt in range(PROBE_TRIES):
+            verdict, reason, answer = probes.check_answer(
+                provider, value, probes.Options(), self.send
+            )
+            if verdict == probes.WORKS or attempt == PROBE_TRIES - 1:
+                break
+            self.ctx.sleep(PROBE_WAIT_S)
+        return verdict, reason, answer
+
+    # ------------------------------------------------------------------ 1 preflight
+
+    def main_only(self, repo: str, environment: str) -> None:
+        base = f"repos/{repo}/environments/{environment}"
+        what = f"reading the {environment} Environment of {repo}"
+
+        def read(path: str) -> dict[str, Any]:
+            try:
+                out = self.gh(1, what, ["gh", "api", path])
+            except StepError:
+                raise StepError(
+                    1,
+                    f"could not read the {environment} Environment of {repo}: it must exist and "
+                    "admit main only",
+                ) from None
+            try:
+                doc: object = json.loads(out)
+            except ValueError:
+                doc = None
+            return cast(dict[str, Any], doc) if isinstance(doc, dict) else {}
+
+        rule = cast(dict[str, Any], read(base).get("deployment_branch_policy") or {})
+        allowed: list[tuple[object, object]] = []
+        if rule.get("custom_branch_policies") and not rule.get("protected_branches"):
+            got = cast(
+                list[Any], read(f"{base}/deployment-branch-policies").get("branch_policies") or []
+            )
+            allowed = [
+                (cast(dict[str, Any], p).get("name"), cast(dict[str, Any], p).get("type", "branch"))
+                for p in got
+                if isinstance(p, dict)
+            ]
+        if allowed != [("main", "branch")]:
+            raise StepError(
+                1,
+                f"the {environment} Environment of {repo} admits more than main; limit it to "
+                "main, then rerun",
+            )
+
+    def preflight_targets(self) -> list[str]:
+        """Every target scope listed once, every Environment checked; problems, as lines."""
+        problems: list[str] = []
+        for a in self.ads:
+            if a.scope() not in self.before:
+                try:
+                    self.before[a.scope()] = a.listing()
+                except targets.TargetError as e:
+                    problems.append(f"cannot reach {a.describe()}: {e}")
+            if isinstance(a, targets.GitHubEnv):
+                try:
+                    self.main_only(a.f("repo"), a.f("environment"))
+                except StepError as e:
+                    problems.append(str(e).split(": ", 1)[1])
+        return problems
+
+    # ------------------------------------------------------------------ dry run
+
+    def dry_run(self) -> int:
+        c, rot = self.c, self.rot
+        problems = self.preflight_targets()
+        for cred in [c, *([self.minter] if self.minter else [])]:
+            try:
+                titles = {t.casefold() for t in self.op.item_titles(cred.vault)}
+            except OpError as e:
+                problems.append(f"could not list {cred.name}'s vault: {e}")
+                continue
+            if cred.item_title.casefold() not in titles:
+                problems.append(f"{cred.name}'s 1Password item is not in its vault")
+        say = self.ctx.say
+        say(f"{c.name}: the plan (dry run)")
+        found = "; ".join(problems) if problems else "every target reachable, items found"
+        say(f"  1 preflight: {found}")
+        if rot.mints and self.minter:
+            say(f"  2 create: mint {self.key_name!r} with {self.minter.name}'s key, into pending")
+        else:
+            say(
+                f"  2 create: open the provider's page for {self.key_name!r}; you paste it into "
+                "the item's pending field, then rerun"
+            )
+        say(f"  3 probe: the new key at {rot.probe}, expecting it to work")
+        say("  4 store: the new key into the main field, the old one into previous")
+        for a in self.ads:
+            say(f"  5 sync: {a.describe()}")
+        say("  6 verify: each target uses it (dates, fingerprints, deploys, workflows)")
+        how = "by API" if rot.revokes_by_api else "on the provider's page, after your click"
+        say(f"  7 revoke: the old key {how}, then probe it, expecting it dead")
+        say("  8 record: fp, rotated and expires in the mapping file")
+        say("keys rotate --dry-run: nothing was changed")
+        return EXIT_FAIL if problems else EXIT_OK
+
+    # ------------------------------------------------------------------ the run
+
+    def go(self) -> int:
+        c = self.c
+        self.fp_key = read_fp_key(self.args.fp_key, self.ctx)
+        problems = self.preflight_targets()
+        if problems:
+            raise StepError(1, "; ".join(problems))
+        self.reload()
+        if self.minter:
+            try:
+                self.minter_value = self.op.read(self.minter.value_ref)
+            except OpError as e:
+                raise UsageError(f"could not read {self.minter.name} from 1Password: {e}") from None
+        f = self.fields()
+        step = f.get(STEP, "")
+        if not step and (f.get(PENDING) or f.get(PREVIOUS)):
+            raise StepError(
+                1,
+                "the item holds a pending or previous value keys did not leave there; clear "
+                "those fields in the 1Password app, then rerun",
+            )
+        self.say(1, f"{len(self.ads)} targets reachable" + (", resuming" if step else ""))
+        if step == "":
+            if self.rot.mints:
+                self.create()
+            else:
+                return self.ask_paste()
+        elif step == AWAITING:
+            if not f.get(PENDING, "").strip():
+                self.ctx.say(f"{c.name}: 2 create: still waiting for the paste")
+                return self.ask_paste()
+            self.clear_clipboard()
+            self.save(2, {STEP: CREATED})
+        if self.fields().get(STEP) == CREATED:
+            self.store(self.check_new())
+        if self.fields().get(STEP) == STORED:
+            self.sync_and_verify()
+        if self.fields().get(STEP) == VERIFIED:
+            waiting = self.revoke_old()
+            if waiting:
+                return EXIT_WAITING
+        if self.fields().get(STEP) == REVOKED:
+            self.record()
+            return EXIT_OK
+        raise StepError(1, "the item's keys_step field holds something keys did not write")
+
+    # ------------------------------------------------------------------ 2 create
+
+    def create(self) -> None:
+        if self.minter is None:  # run() refuses a mint kind without one
+            raise StepError(2, "no minting credential")
+        try:
+            new = self.rot.mint(
+                self.api(), self.minter_value, self.fields(), self.key_name, self.today
+            )
+        except rotators.RotateError as e:
+            raise StepError(2, f"{e}; nothing was changed") from None
+        values = {
+            PENDING: new.value.reveal(),
+            PENDING_ID: new.ident,
+            EXPIRES: new.expires.isoformat() if new.expires else "",
+            STEP: CREATED,
+        }
+        try:
+            self.save(2, values)
+        except StepError as e:
+            gone = self.revoke_new(new.value, new.ident)
+            raise StepError(
+                2, f"{str(e).split(': ', 1)[1]}; {gone}; nothing else changed"
+            ) from None
+        self.say(2, f"made {self.key_name!r} fp:{self.fp(new.value)}, saved as pending")
+
+    def ask_paste(self) -> int:
+        c = self.c
+        try:
+            page = self.rot.create_page(c, self.fields(), self.key_name)
+        except rotators.RotateError as e:
+            raise UsageError(f"{c.name}: {e}") from None
+        if self.fields().get(STEP) != AWAITING:
+            self.save(2, {PENDING: "", PENDING_ID: "", STEP: AWAITING})
+        self.open(page, "the page that makes the new key")
+        self.open_item()
+        repos = sorted({r for a in self.ads for r in _repos(a)})
+        say = self.ctx.say
+        say(f"{c.name}: 2 create: waiting for you, in the browser and 1Password:")
+        say(f"  make the new key on the page just opened: {self.key_name!r}, 180 days or less")
+        if repos:
+            say(f"  repository access, only these: {', '.join(repos)}")
+        say("  copy it and paste it into the pending field of the 1Password item just opened")
+        say("  (never into a terminal or a chat); keep clipboard history and Universal")
+        say("  Clipboard off meanwhile")
+        say(f"  then run: keys rotate {c.name}")
+        return EXIT_WAITING
+
+    def clear_clipboard(self) -> None:
+        try:
+            proc.run(["pbcopy"], proc.child_env(self.environ), stdin="")
+        except proc.ChildError:
+            self.ctx.say(f"{self.c.name}: clear the clipboard: copy something else")
+
+    # ------------------------------------------------------------------ 3 probe, 4 store
+
+    def check_new(self) -> str:
+        """Probe the pending key; its expiry (ISO date or empty) when it passes."""
+        f = self.fields()
+        value = targets.normalise(Secret(f.get(PENDING, "")), self.c.name)
+        verdict, reason, answer = self.probe(value)
+        problem = ""
+        expires = f.get(EXPIRES, "")
+        if verdict != probes.WORKS:
+            problem = f"the new key does not work: {verdict} ({reason})"
+        elif KINDS[self.c.kind].can_expire:
+            found = self.rot.expiry(answer)
+            if found is None and not expires:
+                problem = "the provider shows no expiry for the new key"
+            elif found is not None:
+                expires = found.isoformat()
+        if not problem and expires:
+            left = (datetime.date.fromisoformat(expires) - self.today).days
+            if left > rotators.MAX_DAYS:
+                problem = f"the new key expires in {left} days, over {rotators.MAX_DAYS}"
+        if problem:
+            gone = self.revoke_new(value, f.get(PENDING_ID, ""))
+            self.save(3, {PENDING: "", PENDING_ID: "", EXPIRES: "", STEP: ""})
+            raise StepError(3, f"{problem}; {gone}; pending cleared, nothing else changed")
+        self.say(3, f"the new key fp:{self.fp(value)} works ({reason})")
+        return expires
+
+    def store(self, expires: str) -> None:
+        f = self.fields()
+        c = self.c
+        value = targets.normalise(Secret(f[PENDING]), c.name)
+        values = {
+            c.field: value.reveal(),
+            PREVIOUS: f.get(c.field, ""),
+            PENDING: "",
+            PENDING_ID: "",
+            STEP: STORED,
+            EXPIRES: expires,
+        }
+        if self.rot.id_field:
+            values |= {
+                self.rot.id_field: f.get(PENDING_ID, ""),
+                PREVIOUS_ID: f.get(self.rot.id_field, ""),
+            }
+        self.save(
+            4,
+            values,
+            "the new key is still in the item's pending field; rerun to continue",
+        )
+        self.say(4, "1Password holds the new key, the old one as previous")
+
+    # ------------------------------------------------------------------ 5 sync, 6 verify
+
+    def sync_and_verify(self) -> None:
+        f = self.fields()
+        new = targets.normalise(Secret(f[self.c.field]), self.c.name)
+        fp = self.fp(new)
+        written: list[targets.Adapter] = []
+        for a in self.ads:
+            try:
+                a.write(new, fp)
+            except targets.PartialWrite as e:
+                written.append(a)
+                self.rollback(5, a, str(e), written)
+            except targets.TargetError as e:
+                self.rollback(5, a, str(e), written)
+            written.append(a)
+            self.say(5, f"{a.describe()} fp:{fp}")
+        for a in self.ads:
+            try:
+                self.verify(a, fp)
+            except targets.TargetError as e:
+                self.rollback(6, a, str(e), written)
+            except StepError as e:
+                self.rollback(6, a, str(e).split(": ", 1)[1], written)
+        self.save(6, {STEP: VERIFIED}, "every target uses the new key; rerun to continue")
+
+    def verify(self, a: targets.Adapter, fp: str) -> None:
+        if isinstance(a, targets.Railway):
+            a.redeploy(self.ctx.sleep)
+            self.say(6, f"{a.describe()} deployed")
+            return
+        now = a.listing().get(a.name)
+        if now is None:
+            raise targets.TargetError("the secret is not there after the sync")
+        if isinstance(a, targets.AzureKeyVault | targets.GcpSecret):
+            if now.fp != fp:
+                raise targets.TargetError("its fingerprint tag does not name the new key")
+            self.say(6, f"{a.describe()} carries fp:{fp}")
+            return
+        then = self.before.get(a.scope(), {}).get(a.name)
+        if then is not None and then.updated_at and not now.updated_at > then.updated_at:
+            raise targets.TargetError("GitHub shows no update after the sync")
+        wf = a.target.verify.get("workflow")
+        if wf and isinstance(a, targets.GitHubRepo | targets.GitHubEnv):
+            self.run_workflow(a.f("repo"), wf)
+            self.say(6, f"{a.describe()} updated; {wf} passed")
+        else:
+            self.say(6, f"{a.describe()} updated")
+
+    def _runs(self, repo: str, wf: str) -> list[int]:
+        argv = ["gh", "run", "list", "--repo", repo, "--workflow", wf, "--limit", "20"]
+        out = self.gh(6, "listing runs", [*argv, "--json", "databaseId,event"])
+        try:
+            rows = cast(list[Any], json.loads(out or "[]"))
+        except ValueError:
+            rows = []
+        return [
+            int(cast(dict[str, Any], r)["databaseId"])
+            for r in rows
+            if isinstance(r, dict)
+            and cast(dict[str, Any], r).get("event") == "workflow_dispatch"
+            and isinstance(cast(dict[str, Any], r).get("databaseId"), int)
+        ]
+
+    def run_workflow(self, repo: str, wf: str) -> None:
+        """Dispatch the workflow once on main and watch that run once."""
+        seen = set(self._runs(repo, wf))
+        self.gh(
+            6,
+            "dispatching the workflow",
+            ["gh", "workflow", "run", wf, "--repo", repo, "--ref", "main"],
+        )
+        run_id = None
+        for attempt in range(RUN_LOOKS):
+            fresh = [r for r in self._runs(repo, wf) if r not in seen]
+            if fresh:
+                run_id = fresh[0]
+                break
+            if attempt < RUN_LOOKS - 1:
+                self.ctx.sleep(PROBE_WAIT_S)
+        if run_id is None:
+            raise StepError(6, f"the run {wf} was dispatched, but keys could not find it")
+        argv = ["gh", "run", "watch", str(run_id), "--repo", repo, "--interval", "60"]
+        self.gh(
+            6, f"watching {wf}: the run did not pass", [*argv, "--exit-status"], WATCH_TIMEOUT_S
+        )
+
+    def rollback(
+        self, step: int, at: targets.Adapter, why: str, written: list[targets.Adapter]
+    ) -> None:
+        """Put the old key back where the new one went, in 1Password too, and revoke the new
+        one. Always raises."""
+        f = self.fields()
+        c = self.c
+        old = targets.normalise(Secret(f.get(PREVIOUS, "")), c.name)
+        new = Secret(f.get(c.field, ""))
+        fp_old = self.fp(old)
+        stuck: list[str] = []
+        for a in written:
+            try:
+                a.write(old, fp_old)
+            except targets.TargetError:
+                stuck.append(a.describe())
+        for a in {a.scope(): a for a in written if isinstance(a, targets.Railway)}.values():
+            try:
+                a.redeploy(self.ctx.sleep)
+            except targets.TargetError:
+                stuck.append(f"{a.describe()} (redeploy)")
+        head = f"failed at {at.describe()}: {why}"
+        if stuck:
+            raise StepError(
+                step,
+                f"{head}; the old key could not be put back at {', '.join(stuck)}, so 1Password "
+                "keeps the new key (the old one as previous): rerun to finish the rotation",
+            )
+        values = {c.field: old.reveal(), PREVIOUS: "", PENDING: "", PENDING_ID: "", STEP: ""}
+        new_id = f.get(self.rot.id_field, "") if self.rot.id_field else ""
+        if self.rot.id_field:
+            values |= {self.rot.id_field: f.get(PREVIOUS_ID, ""), PREVIOUS_ID: ""}
+        try:
+            self.save(step, values)
+        except StepError as e:
+            raise StepError(
+                step,
+                f"{head}; every target holds the old key again, but 1Password could not be "
+                f"put back ({str(e).split(': ', 1)[1]}): the old key is in its previous field",
+            ) from None
+        gone = self.revoke_new(new, new_id)
+        raise StepError(
+            step,
+            f"{head}; rolled back: every target and 1Password hold the old key fp:{fp_old} "
+            f"again; {gone}",
+        )
+
+    # ------------------------------------------------------------------ revoking
+
+    def revoke_new(self, value: Secret, key_id: str) -> str:
+        """Revoke a new key that will not be used; what happened, as a phrase."""
+        if self.rot.revokes_by_api and key_id:
+            try:
+                self.rot.revoke(self.api(value), self.minter_value, key_id)
+            except rotators.RotateError as e:
+                return f"the new key could not be revoked ({e}): delete {self.key_name!r} by hand"
+            return "the new key was revoked"
+        if self.rot.revoke_page:
+            self.open(self.rot.revoke_page, "the page to revoke the new key")
+        return f"delete the new key {self.key_name!r} on the page just opened"
+
+    def revoke_old(self) -> bool:
+        """Revoke the old key and see it refused. True when waiting for the owner's click."""
+        f = self.fields()
+        old = targets.normalise(Secret(f.get(PREVIOUS, "")), self.c.name)
+        fp_old = self.fp(old)
+        keep = (
+            "the old key stays in 1Password's previous field; nothing is broken: rerun to try again"
+        )
+        if self.rot.revokes_by_api:
+            try:
+                key_id = rotators.ident(f, PREVIOUS_ID, [old, self.minter_value])
+                self.rot.revoke(self.api(old), self.minter_value, key_id)
+            except rotators.RotateError as e:
+                raise StepError(
+                    7, f"the old key fp:{fp_old} was not revoked: {e}; {keep}"
+                ) from None
+            verdict, reason, _ = self.probe_dead(old)
+            if verdict != probes.DEAD:
+                raise StepError(
+                    7, f"the old key fp:{fp_old} still works after the revoke ({reason}); {keep}"
+                )
+        else:
+            verdict, reason, _ = probes.check_answer(
+                probes.PROVIDERS[self.rot.probe], old, probes.Options(), self.send
+            )
+            if verdict == probes.WORKS:
+                self.open(self.rot.revoke_page, "the page to revoke the old key")
+                self.ctx.say(
+                    f"{self.c.name}: 7 revoke: waiting for you: delete the old key (the one not "
+                    f"named {self.key_name!r}) on the page just opened, then run: keys rotate "
+                    f"{self.c.name}"
+                )
+                return True
+            if verdict != probes.DEAD:
+                raise StepError(
+                    7, f"cannot tell whether the old key fp:{fp_old} is dead ({reason}); {keep}"
+                )
+        self.save(7, {STEP: REVOKED}, "the old key is revoked; rerun to record it")
+        self.say(7, f"the old key fp:{fp_old} is refused now ({reason})")
+        return False
+
+    def probe_dead(self, value: Secret) -> tuple[str, str, probes.Answer]:
+        provider = probes.PROVIDERS[self.rot.probe]
+        got = ("", "", probes.Answer(0, ""))
+        for attempt in range(PROBE_TRIES):
+            got = probes.check_answer(provider, value, probes.Options(), self.send)
+            if got[0] == probes.DEAD or attempt == PROBE_TRIES - 1:
+                break
+            self.ctx.sleep(PROBE_WAIT_S)
+        return got
+
+    # ------------------------------------------------------------------ 8 record
+
+    def record(self) -> None:
+        c = self.c
+        f = self.fields()
+        new = targets.normalise(Secret(f[c.field]), c.name)
+        fp = self.fp(new)
+        expires = f.get(EXPIRES, "") if KINDS[c.kind].can_expire else ""
+        values: dict[str, str | None] = {
+            "fp": json.dumps(fp),
+            "rotated": self.today.isoformat(),
+            "expires": expires or None,
+        }
+        path, _ = listing.mapping_path(self.args, self.ctx)
+        path = path.resolve() if path.is_symlink() else path
+        by_hand = f'fp = "{fp}", rotated = {self.today.isoformat()}' + (
+            f", expires = {expires}" if expires else ""
+        )
+        try:
+            text = path.read_text(encoding="utf-8")
+            new_text = set_entry(text, c.name, values)
+            files.replace(path, new_text)
+        except (OSError, ValueError) as e:
+            raise StepError(
+                8,
+                f"could not write the mapping file ({type(e).__name__}); rerun to record it, or "
+                f"set {by_hand} for {c.name} by hand",
+            ) from None
+        self.save(
+            8,
+            {PREVIOUS: "", PREVIOUS_ID: "", EXPIRES: "", STEP: ""},
+            "the mapping file is recorded; rerun to clear the item's previous field",
+        )
+        self.say(
+            8,
+            f"fp:{fp}, rotated {self.today.isoformat()}"
+            + (f", expires {expires}" if expires else ""),
+        )
+        for a in self.ads:
+            self.ctx.say(f"{c.name}  {a.describe()}  fp:{fp}  in use")
+        self.ctx.say(f"keys rotate: {c.name} rotated; commit the mapping file")
+
+
+def _repos(a: targets.Adapter) -> list[str]:
+    if isinstance(a, targets.GitHubRepo | targets.GitHubEnv):
+        return [a.f("repo")]
+    if isinstance(a, targets.GitHubOrg):
+        repos = a.target.fields.get("repos", [])
+        org = a.f("org")
+        return [f"{org}/{r}" for r in (repos if isinstance(repos, list) else [repos])]
+    return []
+
+
+# ---------------------------------------------------------------------------- the mapping file
+
+CRED_HEADER = re.compile(r"^\s*\[\[\s*credential\s*\]\]\s*(#.*)?$")
+ANY_HEADER = re.compile(r"^\s*\[")
+
+
+def set_entry(text: str, name: str, values: dict[str, str | None]) -> str:
+    """text with these top-level keys of credential `name` set (a TOML literal) or removed
+    (None). Everything else stays byte for byte; the result must parse to the same file apart
+    from these keys, or ValueError."""
+    lines = text.splitlines(keepends=True)
+    starts = [i for i, line in enumerate(lines) if CRED_HEADER.match(line)]
+    name_line = re.compile(rf"^\s*name\s*=\s*{re.escape(json.dumps(name))}\s*(#.*)?$")
+    for n, start in enumerate(starts):
+        end = starts[n + 1] if n + 1 < len(starts) else len(lines)
+        head_end = next((i for i in range(start + 1, end) if ANY_HEADER.match(lines[i])), end)
+        if not any(name_line.match(lines[i].rstrip("\r\n")) for i in range(start + 1, head_end)):
+            continue
+        head = lines[start + 1 : head_end]
+        for key, literal in values.items():
+            pattern = re.compile(rf"^\s*{key}\s*=")
+            at = next((i for i, line in enumerate(head) if pattern.match(line)), None)
+            if at is not None:
+                if literal is None:
+                    del head[at]
+                else:
+                    head[at] = f"{key} = {literal}\n"
+            elif literal is not None:
+                last = max(
+                    (
+                        i
+                        for i, line in enumerate(head)
+                        if line.strip() and not line.lstrip().startswith("#")
+                    ),
+                    default=-1,
+                )
+                if last >= 0 and not head[last].endswith("\n"):
+                    head[last] += "\n"
+                head.insert(last + 1, f"{key} = {literal}\n")
+        out = "".join(lines[: start + 1] + head + lines[head_end:])
+        _same_apart_from(text, out, name, values)
+        return out
+    raise ValueError("credential not found")
+
+
+def _same_apart_from(before: str, after: str, name: str, values: dict[str, str | None]) -> None:
+    old = tomllib.loads(before)
+    new = tomllib.loads(after)
+    for doc in (old, new):
+        for entry in cast(list[dict[str, Any]], doc.get("credential", [])):
+            if entry.get("name") == name:
+                for key in values:
+                    entry.pop(key, None)
+    if old != new:
+        raise ValueError("the edit would change more than the rotation's fields")
+    mapping.parse(tomllib.loads(after), Path("keys.toml"))
+    found = next(e for e in tomllib.loads(after)["credential"] if e.get("name") == name)
+    for key, literal in values.items():
+        if literal is not None and key not in found:
+            raise ValueError("the edit did not take")

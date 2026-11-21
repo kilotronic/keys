@@ -4,8 +4,9 @@ A small command-line tool for the owner's credentials that never prints, logs or
 credential's value. It reads values from 1Password in memory, passes them only on stdin or in a
 child's environment, and prints names, fingerprints, dates and verdicts.
 
-Phase 1 of the design (list, check, scan, scrub and new), and from phase 2, sync, check --all, fp and leaks (the last two taken over from the old key checker). `keys list` and the `generic` kind
-are additions to the design's lists. See [What is next](#what-is-next).
+Phase 1 of the design (list, check, scan, scrub and new), and from phase 2, sync, check --all,
+rotate, fp and leaks (the last two taken over from the old key checker). `keys list` and the
+`generic` kind are additions to the design's lists. See [What is next](#what-is-next).
 
 ## The mapping file
 
@@ -20,12 +21,14 @@ ignore_unmapped = ["DATA_LEAK_DENYLIST"] # optional: secrets at mapped scopes th
 [[credential]]
 name = "app-mail"
 kind = "generic"                         # github-app-key, github-pat, railway-project-token,
-                                         # cloudflare-token, generic
+                                         # cloudflare-token, resend-key, generic
 item = "op://<vault>/<item title>"       # vault and item, no field
 kept_because = "the mail provider has no OIDC sign-in"
 fp = "1a2b3c4d"                          # keyed fingerprint, not secret
 rotated = 2026-11-01
 expires = 2027-04-30
+# minted_by = "mail-admin"               # keys rotate: the credential whose key mints this one
+# permissions = { contents = "read" }    # github-pat: the levels its creation page pre-fills
 
 [[credential.target]]
 type = "railway"                         # also github-actions, github-actions-env,
@@ -290,6 +293,75 @@ keys sync: 2 targets written for 1 credential
   proven against a real project: that a redeploy picks up variables staged with
   `--skip-deploys`, and that `railway deployment list --json` lists the newest first.
 
+### `keys rotate <name> [--dry-run] [--now]`
+
+Replaces a credential end to end, in the design's eight steps, and stops at the first failure:
+
+1. **Preflight.** Every target can be reached, each GitHub Environment target admits `main` only
+   (custom branch policies naming just `main`), and the 1Password item and the minting key can
+   be read.
+2. **Create.** A key keys can mint (Cloudflare, Resend) is made by API with the key of the
+   credential named by `minted_by`, named `<name> <yyyy-mm-dd>`, and saved at once in the item's
+   `pending` field; if that save fails it is revoked at once, since it exists nowhere else. For a
+   GitHub personal token, which no API makes, keys opens GitHub's pre-filled page (name, owner,
+   `expires_in=180`, the `permissions` from the mapping file) and the 1Password item, prints the
+   repositories to pick, and exits 5. The owner pastes the token into the item's `pending` field
+   (never a terminal or a chat) and runs `keys rotate <name>` again, which clears the clipboard
+   and continues.
+3. **Probe.** The new key must work, and where the provider sets an expiry, end within 180 days
+   (GitHub's token-expiry header). If not, it is revoked (or its page opened) and `pending` is
+   cleared.
+4. **Store.** The current key moves to `previous`, the new one to the main field, in one save.
+5. **Sync** to every target, as `keys sync` does.
+6. **Verify.** A GitHub secret's update date moved; with `verify = { workflow = "deploy.yml" }`
+   on its target, that workflow is dispatched once on `main` and watched once
+   (`gh run watch --interval 60 --exit-status`). Railway is redeployed and waited for. Key Vault
+   and Secret Manager carry the new fingerprint.
+7. **Revoke** the old key by API and probe it until it is refused. With no revoke API (GitHub
+   tokens), keys opens the token page, exits 5, and on the next run probes the old token and
+   carries on once it is dead.
+8. **Record** `fp`, `rotated` and, for a kind that expires, `expires` in the mapping file (only
+   those lines of that entry change), clear the item's `previous` field, and print one line per
+   target. Commit the mapping file.
+
+```text
+$ keys rotate deploy
+deploy: 1 preflight: 3 targets reachable
+deploy: 2 create: made 'deploy 2026-11-21' fp:775d9721, saved as pending
+deploy: 3 probe: the new key fp:775d9721 works (HTTP 200 from api.cloudflare.com/client/v4/user/tokens/verify)
+deploy: 4 store: 1Password holds the new key, the old one as previous
+deploy: 5 sync: github-actions-env owner/app env:production CLOUDFLARE_API_TOKEN fp:775d9721
+...
+deploy: 7 revoke: the old key fp:3f9a1c02 is refused now (HTTP 401 from api.cloudflare.com/client/v4/user/tokens/verify)
+deploy: 8 record: fp:775d9721, rotated 2026-11-21, expires 2027-05-20
+deploy  github-actions-env owner/app env:production CLOUDFLARE_API_TOKEN  fp:775d9721  in use
+keys rotate: deploy rotated; commit the mapping file
+```
+
+- **Where it stands** is the item's `keys_step` field (with `pending_id`, `previous_id` and
+  `keys_expires`, none of them secret), so a rerun resumes at the step that stopped: nothing is
+  minted twice and a finished sync is not repeated.
+- **Rollback.** Until step 7 the old key still works and sits in `previous`. A failure in steps 5
+  or 6 writes it back to every target already changed (and redeploys Railway), moves it back to
+  the main field, and revokes the new key. If the old key cannot be put back somewhere, 1Password
+  keeps the new key and a rerun finishes the rotation instead. A failure in step 7 keeps
+  `previous`: the new key is live everywhere, so nothing is broken. Nothing is rolled back after
+  step 7.
+- `--dry-run` reads no value: it lists the targets, checks the Environments and that the items
+  are in their vaults, and prints the plan. Nothing is changed.
+- `--now` is needed for a kind whose provider keeps one key at a time (none of today's kinds),
+  since rotating it means a short outage.
+- Kinds: `cloudflare-token` (a user token; the new one copies the old one's policies and IP
+  condition from `GET /user/tokens/<token_id>`, expires in 180 days, and the old one is deleted;
+  the minting token needs Cloudflare's "Create additional tokens" template), `resend-key` (keeps
+  the item's `permission`, sending-only unless it says `full_access`, and its `domain_id`;
+  minted and deleted with a full-access key; Resend keys have no expiry, so the rotation date
+  counts), and `github-pat` (the paste flow). Account-owned Cloudflare tokens are not handled
+  yet. Resend's `domain_id` parameter and Cloudflare's `result.value` in the create answer are
+  read from the API references, not yet from a real run.
+- Exit 0 when rotated, 1 when a step failed (the line names it), 3 for a usage error, 5 when it
+  waits for the owner (a paste or a click).
+
 ## Shim for check_key.py
 
 The old key checker, `check_key.py`, becomes a thin shim that runs `keys`. Its
@@ -406,17 +478,15 @@ provider issued, as the provider's console does.
 
 Phase 2, from the design:
 
-- `keys rotate <name>`: the eight steps (preflight, create, probe, store, sync, verify, revoke,
-  record), resuming after the owner's paste, with rollback until the old key is revoked. Takes
-  over the Railway, signing-secret, datastore and Twilio rotation of the script it replaces.
-- Revoke by API where the provider has one; otherwise open the provider's page for the owner.
+- `keys rotate` for the rest of the kinds: Twilio sending keys, Railway project and workspace
+  tokens, GitHub App keys, and the Railway signing-secret and datastore rotation of the script
+  it replaces; reading a Railway variable back to verify it.
 - An issue from day 120 in the nightly check (the workflow lives in the mapping repo).
 - The gitleaks pass in `keys scan`, with the shared secret-scan rules and `--redact`, and a
   scan of only the files changed since the last run, for speed.
-- `keys rotate --dry-run` and `--now`.
-- The design's other starting kinds: `railway-workspace-token`, `openai-key`, `resend-key`,
+- The design's other starting kinds: `railway-workspace-token`, `openai-key`,
   `twilio-key`, `azure-app-secret`, and `generated` (a random signing secret, with `mint`).
-- Probes for Railway, Resend and Twilio, so the old rotation script can become a thin shim and
+- Probes for Railway and Twilio, so the old rotation script can become a thin shim and
   then be deleted.
 - A check, once, that `op item create` keeps the empty non-secret fields `keys new` asks for
   (`op item create --dry-run` previews without saving).

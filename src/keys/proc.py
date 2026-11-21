@@ -58,6 +58,7 @@ def run(
     environ: Mapping[str, str],
     *,
     stdin: Secret | str | None = None,
+    timeout: int = TIMEOUT_S,
 ) -> Done:
     text = stdin.reveal() if isinstance(stdin, Secret) else stdin
     # Bytes, not text: no newline translation, and UTF-8 whatever the locale says.
@@ -70,13 +71,13 @@ def run(
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             env=dict(environ),
-            timeout=TIMEOUT_S,
+            timeout=timeout,
             check=False,
         )
     except FileNotFoundError:
         raise ChildError(f"{argv[0]} is not installed") from None
     except subprocess.TimeoutExpired:
-        raise ChildError(f"{argv[0]} took longer than {TIMEOUT_S}s") from None
+        raise ChildError(f"{argv[0]} took longer than {timeout}s") from None
     except OSError as e:
         raise ChildError(f"{argv[0]} could not start ({type(e).__name__})") from None
     return Done(r.returncode, r.stdout.decode(errors="replace"))

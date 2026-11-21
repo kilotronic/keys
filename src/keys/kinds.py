@@ -16,6 +16,9 @@ class Kind:
     # The provider can set an expiry on it. When not, the rotation date counts: it expires
     # 180 days after it was rotated.
     can_expire: bool = False
+    # The provider keeps one key at a time (a roll in place), so rotating it means a short
+    # outage: keys rotate refuses it without --now.
+    single_key: bool = False
 
 
 KINDS: dict[str, Kind] = {
@@ -34,6 +37,11 @@ KINDS: dict[str, Kind] = {
             "a Cloudflare API token",
             ("token_id", "account_id"),
             can_expire=True,
+        ),
+        Kind(
+            "resend-key",
+            "a Resend API key",
+            ("key_id", "domain_id", "permission"),
         ),
         Kind("generic", "any other credential", (), provider_issued=False),
     ]

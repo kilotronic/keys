@@ -72,3 +72,52 @@ class Op:
                 }
             )
         return rows
+
+    def item_get(self, vault: str, title: str) -> dict[str, Any]:
+        """The item, fields and values, parsed in process (op's JSON holds concealed values;
+        nothing of it is ever printed)."""
+        out = self._run(
+            "reading the item", ["op", "item", "get", title, "--vault", vault, "--format", "json"]
+        )
+        try:
+            item = json.loads(out)
+        except ValueError:
+            raise OpError("op item get printed something keys cannot read") from None
+        if not isinstance(item, dict):
+            raise OpError("op item get printed something keys cannot read")
+        found = cast(dict[str, Any], item)
+        if not isinstance(found.get("fields"), list):
+            raise OpError("op item get printed something keys cannot read")
+        return found
+
+    def item_edit(self, vault: str, item: dict[str, Any]) -> None:
+        """The item replaced by item, sent as JSON on stdin (never field=value arguments)."""
+        self._run(
+            "saving the item",
+            ["op", "item", "edit", str(item["id"]), "--vault", vault],
+            stdin=json.dumps(item),
+        )
+
+
+def fields(item: dict[str, Any]) -> dict[str, str]:
+    """An item's fields, label to value."""
+    out: dict[str, str] = {}
+    for f in cast(list[Any], item.get("fields", [])):
+        if isinstance(f, dict):
+            d = cast(dict[str, Any], f)
+            out[str(d.get("label", ""))] = str(d.get("value") or "")
+    return out
+
+
+def set_fields(item: dict[str, Any], values: dict[str, str], concealed: set[str]) -> None:
+    """Set each field of item by label, adding a missing one (concealed when named so)."""
+    rows = cast(list[dict[str, Any]], item["fields"])
+    by_label = {str(f.get("label", "")): f for f in rows}
+    for label, value in values.items():
+        if label in by_label:
+            by_label[label]["value"] = value
+        else:
+            kind = "CONCEALED" if label in concealed else "STRING"
+            row = {"id": label, "label": label, "type": kind, "value": value}
+            rows.append(row)
+            by_label[label] = row

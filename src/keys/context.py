@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import IO, Any
 
 EXIT_OK, EXIT_FAIL, EXIT_UNKNOWN, EXIT_USAGE, EXIT_INTERNAL = 0, 1, 2, 3, 4
+EXIT_WAITING = 5  # keys rotate is waiting for the owner: a paste, or a click on a page
 
 
 class UsageError(Exception):
