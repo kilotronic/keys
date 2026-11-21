@@ -57,7 +57,11 @@ CREDENTIAL_FIELDS = {
     "rotated",
     "expires",
     "target",
+    "minted_by",
+    "permissions",
 }
+# A GitHub token's permission levels, as its pre-filled creation page takes them.
+LEVELS = {"read", "write", "admin"}
 # Target type: (required fields, optional fields), besides `type` and `verify`.
 TARGETS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "github-actions": (("repo", "secret"), ()),
@@ -97,6 +101,8 @@ class Credential:
     rotated: datetime.date | None = None
     expires: datetime.date | None = None
     targets: list[Target] = dataclasses.field(default_factory=lambda: list[Target]())
+    minted_by: str = ""  # the credential (by name) whose key mints this one
+    permissions: dict[str, str] = dataclasses.field(default_factory=lambda: dict[str, str]())
 
     @property
     def item(self) -> str:
@@ -259,6 +265,23 @@ def _credential(
         if not FP.fullmatch(fp):
             problems.append(f"{where}.fp: must be 8 lower-case hex digits")
     rotated = _date(f"{where}.rotated", c["rotated"], problems) if "rotated" in c else None
+    minted_by = ""
+    if "minted_by" in c:
+        minted_by = c["minted_by"] if isinstance(c["minted_by"], str) else ""
+        if not NAME.fullmatch(minted_by) or looks.name_looks_like_value(minted_by):
+            problems.append(f"{where}.minted_by: must be another credential's name")
+    permissions: dict[str, str] = {}
+    if "permissions" in c:
+        if not isinstance(c["permissions"], dict):
+            problems.append(f'{where}.permissions: must be a table, like {{ contents = "read" }}')
+        else:
+            for k, v in cast(dict[str, object], c["permissions"]).items():
+                if not looks.plain_key(k):
+                    problems.append(f"{where}.permissions: a key that is not a plain name")
+                elif v not in LEVELS:
+                    problems.append(f"{where}.permissions: each must be read, write or admin")
+                else:
+                    permissions[k] = cast(str, v)
     expires = _date(f"{where}.expires", c["expires"], problems) if "expires" in c else None
 
     targets: list[Target] = []
@@ -285,6 +308,8 @@ def _credential(
         rotated=rotated,
         expires=expires,
         targets=targets,
+        minted_by=minted_by,
+        permissions=permissions,
     )
 
 

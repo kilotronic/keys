@@ -43,7 +43,7 @@ import traceback
 from collections.abc import Callable, Generator, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import quote, quote_plus
 
 import pytest
@@ -58,7 +58,7 @@ PIECE = 9  # a run of this many of the value's characters is a leak (the hint sh
 ENCODED_PIECE = 12
 HERE = Path(__file__).parent
 FAKE_CHILD = HERE / "fake_child.py"
-FAKE_PROGRAMS = ("op", "gh", "railway", "az", "gcloud", "security", "pbcopy")
+FAKE_PROGRAMS = ("op", "gh", "railway", "az", "gcloud", "security", "pbcopy", "open")
 # The only children that may be handed a value on stdin: 1Password's item writes and each
 # target's write command, matched on their leading words (so `az keyvault secret show` is not).
 STDIN_OK = (
@@ -220,6 +220,8 @@ class Canary:
         )
         self.planted: dict[Path, str] = {}
         self.extra_values: list[str] = []
+        # Values no target may ever receive (a minting key): a write of one fails the test.
+        self.never_written: list[str] = []
 
     # ------------------------------------------------------------------ setting the scene
 
@@ -309,13 +311,95 @@ class Canary:
         self.db.setdefault("child_print", []).append({"words": words, "stdout": stdout})
         self._save_db()
 
-    def child_fails(self, words: list[str], code: int = 1) -> None:
-        """A fake child whose program and leading words are these fails with code; its error
-        text holds the canary."""
+    def child_fails(
+        self, words: list[str], code: int = 1, *, skip: int = 0, after: bool = False
+    ) -> None:
+        """A fake child whose program and leading words are these fails with code, after the
+        first `skip` such calls succeed; its error text holds the canary. With `after`, a
+        target call takes effect first and then fails (a write that timed out but landed)."""
+        self._load_db()
         self.db.setdefault("child_fail", []).append(
-            {"words": words, "code": code, "stderr": f"error: {self.value}"}
+            {
+                "words": words,
+                "code": code,
+                "stderr": f"error: {self.value}",
+                "skip": skip,
+                "after": after,
+            }
         )
         self._save_db()
+
+    def clear_child_fails(self) -> None:
+        self.set_db("child_fail", [])
+
+    CONCEALED = ("credential", "pending", "previous")
+
+    def op_item(self, vault: str, title: str, fields: dict[str, str]) -> str:
+        """A 1Password item with these fields (label: value), as `op item get --format json`
+        prints it; the concealed ones are watched. Returns its id."""
+        self._load_db()
+        ident = f"item{len(self.db['items']) + 1}"
+        rows = [
+            {
+                "id": label,
+                "label": label,
+                "type": "CONCEALED" if label in self.CONCEALED else "STRING",
+                "value": value,
+            }
+            for label, value in fields.items()
+        ]
+        self.db["items"].append(
+            {
+                "id": ident,
+                "title": title,
+                "category": "API_CREDENTIAL",
+                "vault": {"id": f"v-{vault.lower()}", "name": vault},
+                "fields": rows,
+            }
+        )
+        for label, value in fields.items():
+            if label in self.CONCEALED and value:
+                self.watch(value)
+        self._save_db()
+        return ident
+
+    def op_fields(self, vault: str, title: str) -> dict[str, str]:
+        """An item's fields now, by label."""
+        self._load_db()
+        for item in self.db["items"]:
+            if item["vault"]["name"] == vault and item["title"] == title and "fields" in item:
+                return {f["label"]: f.get("value") or "" for f in item["fields"]}
+        raise KeyError(title)
+
+    def op_set_field(self, vault: str, title: str, label: str, value: str) -> None:
+        """What the owner does in the 1Password app: paste value into a field."""
+        self._load_db()
+        for item in self.db["items"]:
+            if item["vault"]["name"] == vault and item["title"] == title and "fields" in item:
+                for f in item["fields"]:
+                    if f["label"] == label:
+                        f["value"] = value
+                        break
+                else:
+                    item["fields"].append(
+                        {"id": label, "label": label, "type": "CONCEALED", "value": value}
+                    )
+        self.watch(value)
+        self._save_db()
+
+    def gh_api(self, path: str, answer: Any) -> None:
+        """What the fake `gh api <path>` prints (absent: it fails as a 404 does)."""
+        self._load_db()
+        self.db.setdefault("gh_api", {})[path] = answer
+        self._save_db()
+
+    def gh_main_only(self, repo: str, environment: str, branches: list[str] | None = None) -> None:
+        """A GitHub Environment whose deployments are limited to these branches (main)."""
+        base = f"repos/{repo}/environments/{environment}"
+        rule = {"protected_branches": False, "custom_branch_policies": True}
+        self.gh_api(base, {"name": environment, "deployment_branch_policy": rule})
+        policies = [{"name": b, "type": "branch"} for b in (branches or ["main"])]
+        self.gh_api(f"{base}/deployment-branch-policies", {"branch_policies": policies})
 
     def target_put(self, key: str, value: str, **meta: Any) -> None:
         """A secret already at a target, under the fake's key (see fake_child.target_key):
@@ -535,13 +619,27 @@ class Canary:
 
     # ------------------------------------------------------------------ checking
 
-    def _expected_write(self, data: str) -> bool:
-        """A target write carries exactly one value 1Password holds (the canary or an
-        op_value), as read or with its trailing line breaks removed (keys's one change)."""
-        for v in [self.value, *self.db.get("values", {}).values()]:
-            if v and data in (v, v.rstrip("\n")):
-                return True
-        return False
+    def _held(self, children: list[Child]) -> list[str]:
+        """Every value 1Password held during the run: the canary, op_values, the items' fields
+        now, and every field an item write sent (a rotation moves values between fields)."""
+        self._load_db()
+        held = [self.value, *self.db.get("values", {}).values()]
+        for item in self.db.get("items", []):
+            held += [str(f.get("value") or "") for f in item.get("fields", [])]
+        for c in children:
+            words = tuple(a for a in c.argv if not a.startswith("-"))
+            if any(words[: len(w)] == w for w in ITEM_WRITES) and c.stdin:
+                with contextlib.suppress(ValueError, KeyError, TypeError):
+                    sent = json.loads(c.stdin)
+                    held += [str(f.get("value") or "") for f in sent["fields"]]
+        return [v for v in held if v]
+
+    def _expected_write(self, data: str, held: list[str]) -> bool:
+        """A target write carries exactly one value 1Password held (the canary, an op_value or
+        an item field), as read or with its trailing line breaks removed (keys's one change)."""
+        if any(data in (v, v.rstrip("\n")) for v in self.never_written):
+            return False
+        return any(data in (v, v.rstrip("\n")) for v in held)
 
     def secrets(self) -> list[str]:
         return [self.value, *self.extra_values]
@@ -556,12 +654,15 @@ class Canary:
         ]
         if escaped is not None:
             channels.append(("exception", escaped.encode()))
+        held = self._held(result.children)
         for c in result.children:
             words = tuple(a for a in c.argv if not a.startswith("-"))
             if not stdin_ok(c.argv) or any(words[: len(w)] == w for w in ITEM_WRITES):
                 if not stdin_ok(c.argv):
                     channels.append((f"stdin of {c.prog}", c.stdin.encode()))
-            elif c.stdin and not self._expected_write(c.stdin):
+                else:
+                    channels += _plain_fields(c.stdin)
+            elif c.stdin and not self._expected_write(c.stdin, held):
                 raise LeakError(f"the stdin of {c.prog} is not exactly one value 1Password holds")
             channels.append((f"argv of {c.prog}", "\0".join(c.argv).encode()))
         for e in events:
@@ -646,6 +747,26 @@ class Canary:
                     except OSError as e:
                         refuse(e)
                     yield path
+
+
+def _plain_fields(stdin: str) -> list[tuple[str, bytes]]:
+    """The fields of an item write that are not concealed, and its other parts: a value may
+    sit only in a concealed field."""
+    try:
+        doc: object = json.loads(stdin)
+    except ValueError:
+        doc = None
+    if not isinstance(doc, dict):
+        return [("an op item write keys sent", stdin.encode())]
+    item = cast(dict[str, Any], doc)
+    out: list[tuple[str, bytes]] = []
+    for raw in cast(list[Any], item.get("fields") or []):
+        f = cast(dict[str, Any], raw) if isinstance(raw, dict) else {}
+        if f.get("type") != "CONCEALED":
+            out.append((f"plain field {f.get('label')!r} of an op item write", str(f).encode()))
+    rest = {k: v for k, v in item.items() if k != "fields"}
+    out.append(("the rest of an op item write", json.dumps(rest).encode()))
+    return out
 
 
 def _under(path: Path, root: Path) -> bool:

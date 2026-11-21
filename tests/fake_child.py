@@ -57,6 +57,11 @@ OP_VALUE_FLAGS = {
     "--update-labels",
     "--labels",
     "--replication-policy",
+    # gh workflows and runs
+    "--workflow",
+    "--ref",
+    "--limit",
+    "--interval",
 }
 
 
@@ -101,8 +106,9 @@ def main(prog: str, argv: list[str]) -> int:
     _log({"id": me, "prog": prog, "argv": [prog, *argv], "env": sorted(os.environ)})
     words, flags = words_and_flags(argv)
     stdin = ""
-    if prog != "op" or "-" in words:
-        stdin = _read_stdin(2.0 if "-" in words else 0.5)
+    edit = prog == "op" and words[:2] == ["item", "edit"]
+    if prog != "op" or "-" in words or edit:
+        stdin = _read_stdin(2.0 if "-" in words or edit else 0.5)
         _log({"id": me, "stdin": stdin})
     with open(os.environ["KEYS_FAKE_DB"], encoding="utf-8") as f:
         db: dict[str, Any] = json.load(f)
@@ -110,28 +116,45 @@ def main(prog: str, argv: list[str]) -> int:
         if [prog, *words][: len(odd["words"])] == odd["words"]:
             print(odd["stdout"])
             return 0
+    late: dict[str, Any] | None = None
     for fail in db.get("child_fail", []):
         if [prog, *words][: len(fail["words"])] == fail["words"]:
+            if int(fail.get("skip", 0)) > 0:  # let this many matching calls through first
+                fail["skip"] = int(fail["skip"]) - 1
+                _save(db)
+                continue
+            if fail.get("after"):  # the call takes effect, then reports a failure, once
+                late = fail
+                db["child_fail"].remove(fail)
+                break
             print(fail.get("stderr", ""), file=sys.stderr)
             return int(fail["code"])
     if prog == "az" and words[:3] == ["keyvault", "secret", "show"]:
         return _az_show(db, argv)
+    if prog in ("open", "pbcopy"):
+        return 0
     if prog != "op":
         code = targets(prog, words, flags, stdin, db)
         if code is None:
             print(f"fake {prog}: no answer for this call", file=sys.stderr)
             return 64
         _save(db)
+        if late is not None:
+            print(late.get("stderr", ""), file=sys.stderr)
+            return int(late["code"])
         return code
     if words[:1] == ["read"] and len(words) == 2:
         ref = words[1]
         if ref in db["fail"]:
             print(db["fail"][ref]["stderr"], file=sys.stderr)
             return int(db["fail"][ref]["code"])
-        if ref not in db["values"]:
+        found = db["values"].get(ref)
+        if found is None:
+            found = _item_field(db, ref)
+        if found is None:
             print(f'[ERROR] could not read secret "{ref}": not found', file=sys.stderr)
             return 1
-        value: str = db["values"][ref]
+        value: str = found
         no_newline = "--no-newline" in flags or "-n" in flags
         sys.stdout.write(value if no_newline else value + "\n")
         return 0
@@ -145,6 +168,33 @@ def main(prog: str, argv: list[str]) -> int:
         items = [i for i in db["items"] if vault is None or i["vault"]["name"] == vault]
         items = [i for i in items if tag is None or tag in i.get("tags", [])]
         print(json.dumps(items))
+        return 0
+    if words[:2] == ["item", "get"] and len(words) == 3:
+        item = _item(db, _flag(flags, "--vault"), title=words[2])
+        if item is None or flags.get("--format") != "json":
+            print("[ERROR] item not found", file=sys.stderr)
+            return 1
+        race = db.get("item_step_race")
+        if race and race["title"] == words[2] and not race.get("done"):
+            race["gets"] = int(race.get("gets", 0)) + 1
+            if race["gets"] >= 2:  # another run moved the item on since this one read it
+                race["done"] = True
+                fields = [f for f in item["fields"] if f.get("label") != "keys_step"]
+                fields.append({"id": "keys_step", "label": "keys_step", "value": race["step"]})
+                item["fields"] = fields
+            _save(db)
+        print(json.dumps(item))
+        return 0
+    if edit and len(words) == 3:
+        item = _item(db, _flag(flags, "--vault"), ident=words[2])
+        if item is None:
+            print("[ERROR] item not found", file=sys.stderr)
+            return 1
+        sent = json.loads(stdin)
+        item["fields"] = sent["fields"]  # the real op replaces the item with the JSON given
+        db["edits"] = int(db.get("edits", 0)) + 1
+        _save(db)
+        print(json.dumps({"id": item["id"]}))
         return 0
     if words[:2] == ["item", "create"]:
         fail = db.get("create_fail")
@@ -169,6 +219,31 @@ def main(prog: str, argv: list[str]) -> int:
         return 0
     print("fake op: no answer for this call", file=sys.stderr)
     return 64
+
+
+def _item(
+    db: dict[str, Any], vault: str, *, title: str = "", ident: str = ""
+) -> dict[str, Any] | None:
+    for item in db["items"]:
+        if item["vault"]["name"] != vault or "fields" not in item:
+            continue
+        if (title and item["title"] == title) or (ident and item["id"] == ident):
+            return item
+    return None
+
+
+def _item_field(db: dict[str, Any], ref: str) -> str | None:
+    """`op read op://<vault>/<title>/<field>` answered from an item's fields."""
+    parts = ref.removeprefix("op://").split("/")
+    if len(parts) != 3:
+        return None
+    item = _item(db, parts[0], title=parts[1])
+    if item is None:
+        return None
+    for f in item["fields"]:
+        if f.get("label") == parts[2]:
+            return str(f.get("value") or "")
+    return None
 
 
 def _save(db: dict[str, Any]) -> None:
@@ -227,6 +302,39 @@ def targets(
         # gh trims a value read from stdin of its trailing line breaks.
         _put(db, target_key("gh", flags, w[3]), stdin.rstrip("\r\n"), **meta)
         return 0
+    if w[:2] == ["gh", "api"] and len(w) == 3:
+        found = db.get("gh_api", {}).get(w[2])
+        if found is None:
+            print("gh: Not Found (HTTP 404)", file=sys.stderr)
+            return 1
+        print(json.dumps(found))
+        return 0
+    if w[:3] == ["gh", "workflow", "run"] and len(w) == 4:
+        runs: list[dict[str, Any]] = db.setdefault("runs", [])
+        runs.insert(
+            0,
+            {
+                "databaseId": len(runs) + 100,
+                "event": "workflow_dispatch",
+                "workflow": w[3],
+                "repo": _flag(flags, "--repo"),
+                "ref": _flag(flags, "--ref"),
+            },
+        )
+        for other in db.pop("runs_on_dispatch", []):  # someone else's, started just after
+            runs.insert(0, {"databaseId": len(runs) + 100, **other})
+        return 0
+    if w[:3] == ["gh", "run", "list"]:
+        rows = [
+            {"databaseId": r["databaseId"], "event": r["event"], "headBranch": r["ref"]}
+            for r in db.get("runs", [])
+            if r["workflow"] == _flag(flags, "--workflow") and r["repo"] == _flag(flags, "--repo")
+        ]
+        print(json.dumps(rows[: int(_flag(flags, "--limit") or 20)]))
+        return 0
+    if w[:3] == ["gh", "run", "watch"] and len(w) == 4:
+        db.setdefault("watched", []).append(int(w[3]))
+        return int(db.get("run_result", 0))
     if w[:3] == ["gh", "secret", "list"]:
         prefix = target_key("gh", flags, "")
         rows = [{"name": n, "updatedAt": v["updated_at"]} for n, v in _under(db, prefix).items()]
