@@ -401,7 +401,7 @@ class Canary:
         policies = [{"name": b, "type": "branch"} for b in (branches or ["main"])]
         self.gh_api(f"{base}/deployment-branch-policies", {"branch_policies": policies})
 
-    def target_put(self, key: str, value: str, **meta: Any) -> None:
+    def target_put(self, key: str, value: str, *, secret: bool = True, **meta: Any) -> None:
         """A secret already at a target, under the fake's key (see fake_child.target_key):
         `gh:<repo>:<name>`, `gh:<repo>:env:<env>:<name>`, `gh:org:<org>:<name>`,
         `railway:<project>:<service>:<environment>:<name>`, `az:<vault>:<name>`,
@@ -409,7 +409,8 @@ class Canary:
         self._load_db()
         entry = {"value": value, "updated_at": "2026-01-01T00:00:00Z", "writes": 0, **meta}
         self.db.setdefault("targets", {})[key] = entry
-        self.watch(value)
+        if secret:  # a key's SID or other plain field is not watched
+            self.watch(value)
         self._save_db()
 
     def target(self, key: str) -> dict[str, Any] | None:

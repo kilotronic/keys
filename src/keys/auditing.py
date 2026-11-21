@@ -103,7 +103,10 @@ def run(args: argparse.Namespace, ctx: Context) -> int:
                     skipped += 1
                     ctx.say(f"{c.name}  {a.describe()}  skipped: Railway is checked with --deep")
                 else:
-                    _railway(c, a, fp_key, real, report)
+                    field_fp = real
+                    if a.target.field:
+                        field_fp = _deep_field(c, a.target.field, op, fp_key, report)
+                    _railway(c, a, fp_key, field_fp, report)
                 continue
             checked += 1
             scopes.setdefault(a.scope(), a)
@@ -169,6 +172,18 @@ def _expired(text: str) -> bool:
     if when.tzinfo is None:
         when = when.replace(tzinfo=datetime.UTC)
     return when <= datetime.datetime.now(datetime.UTC)
+
+
+def _deep_field(
+    c: mapping.Credential, name: str, op: Op, fp_key: Secret, report: _Report
+) -> str | None:
+    """The keyed fingerprint of a non-secret field of c's item that a target receives."""
+    try:
+        value = targets.normalise(op.read(f"{c.item}/{name}"), c.name)
+    except (OpError, UsageError):
+        report.bad(c.name, "1Password", f"cannot read its {name} field")
+        return None
+    return fingerprint(fp_key, value) if value.reveal() else None
 
 
 def _deep_value(c: mapping.Credential, op: Op, fp_key: Secret, report: _Report) -> str | None:

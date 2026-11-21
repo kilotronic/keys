@@ -253,3 +253,35 @@ def test_ignore_unmapped_refuses_anything_else_without_repeating_it(
 ) -> None:
     message = errors(tmp_path, f"ignore_unmapped = {bad}\n" + GOOD)
     assert "ignore_unmapped: must be a list of secret names" in message
+
+
+TW = """
+[[credential]]
+name = "sms"
+kind = "twilio-key"
+item = "op://Vault/twilio-key sms"
+kept_because = "Twilio has no OIDC sign-in"
+
+[[credential.target]]
+"""
+
+
+def test_a_target_can_take_a_field_of_the_item(tmp_path: Path) -> None:
+    m = load(
+        tmp_path, TW + 'type = "github-actions"\nrepo = "o/r"\nsecret = "S"\nfield = "key_sid"\n'
+    )
+    assert m.credentials[0].targets[0].field == "key_sid"
+
+
+@pytest.mark.parametrize(
+    ("target", "message"),
+    [
+        ('type = "github-actions"\nrepo = "o/r"\nsecret = "S"\nfield = "nope"\n', "fields are"),
+        ('type = "azure-key-vault"\nvault = "kv"\nsecret = "s"\nfield = "key_sid"\n', "only"),
+        (f'type = "github-actions"\nrepo = "o/r"\nsecret = "S"\nfield = {Q}\n', "must name"),
+    ],
+)
+def test_a_bad_target_field_is_refused(tmp_path: Path, target: str, message: str) -> None:
+    text = errors(tmp_path, TW + target)
+    assert message in text
+    assert find_leak(CANARY, text.encode()) is None

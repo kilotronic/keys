@@ -21,7 +21,8 @@ ignore_unmapped = ["DATA_LEAK_DENYLIST"] # optional: secrets at mapped scopes th
 [[credential]]
 name = "app-mail"
 kind = "generic"                         # github-app-key, github-pat, railway-project-token,
-                                         # cloudflare-token, resend-key, generic
+                                         # railway-workspace-token, cloudflare-token,
+                                         # resend-key, twilio-key, generic
 item = "op://<vault>/<item title>"       # vault and item, no field
 kept_because = "the mail provider has no OIDC sign-in"
 fp = "1a2b3c4d"                          # keyed fingerprint, not secret
@@ -35,6 +36,9 @@ type = "railway"                         # also github-actions, github-actions-e
 service = "app"                          # github-actions-org, azure-key-vault, gcp-secret
 environment = "production"
 variable = "MAIL_API_KEY"
+# field = "key_sid"                      # optional: send this non-secret field of the item
+                                         # instead of the key (a Twilio key's SID); GitHub
+                                         # and Railway targets only
 ```
 
 A mistake names the field and never repeats what it held, since a value pasted into the wrong
@@ -87,7 +91,15 @@ github key fp:3f9a1c02 github_p…Ab3d: DEAD (HTTP 401 from api.github.com/rate_
 - A key goes only over https (plain http only to this machine, never through a proxy), and a
   redirect is not followed, since following it would send the key on to wherever it points.
 - `keys check --list` names the services. `http` covers any HTTPS API (`--url`, then
-  `--header 'Name: {key}'`, `--bearer` or `--query NAME`).
+  `--header 'Name: {key}'`, `--bearer` or `--query NAME`). Added in phase 2: `github-app` (an
+  App's private key signs a JWT, `--client-id`, and reads `GET /app`), `twilio` (`--user` the
+  key's SID, `--account` the account SID), `railway-project` and `railway` (a workspace or
+  account token), the last two read from Railway's GraphQL answer, which is 200 either way.
+- **Why the App's JWT is signed in pure Python.** The design keeps keys to the standard library
+  so the tool that holds every key pulls in no third-party code. RS256 signing is small
+  (`keys.appjwt`: read the PEM, pad the digest as PKCS#1 v1.5 says, raise it to the private
+  exponent) and nothing here verifies or decrypts, which is where hand-written RSA goes wrong;
+  its tests check the signature with the RSA equation and with `openssl`.
 - Exit 0 for WORKS (or the `--expect` verdict), 1 for DEAD (or the other), 2 for UNKNOWN, 3 for
   a usage error.
 
@@ -236,7 +248,9 @@ made the 1Password item cloudflare-token deploy in <vault>, and added deploy to 
 next: paste the value into its credential field in the 1Password app (never a terminal or a chat)
 ```
 
-Kinds: `github-app-key`, `github-pat`, `railway-project-token`, `cloudflare-token`, `generic`.
+Kinds: `github-app-key` (fields `app_id`, `client_id`, `slug`), `github-pat`,
+`railway-project-token` (`project_id`, `environment_id`, `token_id`), `railway-workspace-token`,
+`cloudflare-token`, `resend-key`, `twilio-key` (`key_sid`, `account_sid`) and `generic`.
 
 ### `keys sync <name> | --all [--dry-run]`
 
@@ -265,6 +279,10 @@ and never the variable the fingerprint key came from.
 Every target stores the same bytes: `gh` trims a value's trailing line breaks and `az` folds
 CR LF, so keys refuses a value holding a carriage return and removes trailing line breaks
 before any write, for every target alike. The fingerprint is of what the targets hold.
+
+A target with `field = "<name>"` gets that non-secret field of the item instead of the key,
+read the same way (`op read op://<vault>/<item>/<name>`): a Twilio key's SID goes next to its
+secret, and both change together in a rotation.
 
 ```text
 $ keys sync app-mail
@@ -370,9 +388,32 @@ keys rotate: deploy rotated; commit the mapping file
   the minting token needs Cloudflare's "Create additional tokens" template), `resend-key` (keeps
   the item's `permission`, sending-only unless it says `full_access`, and its `domain_id`;
   minted and deleted with a full-access key; Resend keys have no expiry, so the rotation date
-  counts), and `github-pat` (the paste flow). Account-owned Cloudflare tokens are not handled
-  yet. Resend's `domain_id` parameter and Cloudflare's `result.value` in the create answer are
-  read from the API references, not yet from a real run.
+  counts), `github-pat` (the paste flow), and:
+  - `twilio-key`: a standard or restricted key, minted and deleted with a Main key (its
+    `minted_by` item holds the Main key's `key_sid` and secret) for the item's `account_sid`.
+    The new key's SID goes to every target with `field = "key_sid"`. No expiry; the rotation
+    date counts.
+  - `railway-project-token`: minted with the workspace token named by `minted_by`, for the
+    item's `project_id` and `environment_id`, named `<name> <yyyy-mm-dd>` (refused if a token
+    of that name is there already), found again by name for its id, and the old one deleted by
+    `token_id`. If Railway does not list the new token's id, the rotation still finishes and
+    says to fill `token_id` by hand. No expiry.
+  - `railway-workspace-token`: only the dashboard makes and deletes one, so keys opens
+    `railway.com/account/tokens` for the paste, and again for the old token's delete.
+  - `github-app-key`: GitHub makes an App key only as a browser download, on the App's page
+    (`owner` is the org that owns the App; leave it out for one your own account owns; the
+    item's `slug` names the App). keys opens that page; on the next run it takes the one file
+    named `<slug>.<date>.private-key.pem` from `~/Downloads`, saves it in the item's `pending`
+    field and deletes the file, so the key is never opened, copied or pasted. Several such
+    files are refused (delete all but the newest). The probe signs a JWT with the key and
+    reads `GET /app`. GitHub allows 25 keys at once, so the new key works before the old one
+    is deleted on the same page.
+  - Railway variables are read back in memory after the sync and their fingerprint compared,
+    before each Railway service is redeployed once.
+    Account-owned Cloudflare tokens are not handled yet. Not yet proven against the real
+    services, only against their API references: Resend's `domain_id`, Cloudflare's
+    `result.value`, Twilio's key answer, and Railway's `projectTokenCreate`, `projectTokens` and
+    `projectTokenDelete` (undocumented; read from its public GraphQL schema).
 - Exit 0 when rotated, 1 when a step failed (the line names it), 3 for a usage error, 5 when it
   waits for the owner (a paste or a click).
 
@@ -512,15 +553,12 @@ Agents sign in to GitHub as an App instead of the owner's own login (design: the
 
 Phase 2, from the design:
 
-- `keys rotate` for the rest of the kinds: Twilio sending keys, Railway project and workspace
-  tokens, GitHub App keys, and the Railway signing-secret and datastore rotation of the script
-  it replaces; reading a Railway variable back to verify it.
+- `keys rotate` for the Railway signing-secret and datastore rotation of the script it
+  replaces.
 - An issue from day 120 in the nightly check (the workflow lives in the mapping repo).
 - The gitleaks pass in `keys scan`, with the shared secret-scan rules and `--redact`, and a
   scan of only the files changed since the last run, for speed.
-- The design's other starting kinds: `railway-workspace-token`, `openai-key`,
-  `twilio-key`, `azure-app-secret`, and `generated` (a random signing secret, with `mint`).
-- Probes for Railway and Twilio, so the old rotation script can become a thin shim and
-  then be deleted.
+- The design's other starting kinds: `openai-key`, `azure-app-secret`, and `generated` (a
+  random signing secret, with `mint`).
 - A check, once, that `op item create` keeps the empty non-secret fields `keys new` asks for
   (`op item create --dry-run` previews without saving).

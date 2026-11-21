@@ -1,4 +1,5 @@
-"""Made-up Cloudflare, Resend and GitHub APIs, answering keys's HTTPS client in process.
+"""Made-up Cloudflare, Resend, GitHub, Twilio and Railway APIs, answering keys's HTTPS client in
+process.
 
 Each fake keeps its keys by value, so a probe with a revoked key gets the provider's own "dead"
 answer, and a key it mints is a fresh random value that the canary watches. Nothing here
@@ -8,15 +9,19 @@ canary, so a test proves keys never passes a provider's text through.
 
 from __future__ import annotations
 
+import base64
 import datetime
+import hashlib
 import json
 import secrets
 import string
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
+from keys import appjwt
 from keys.probes import Answer
+from keys.secret import Secret
 from tests.canary import Canary, LeakError
 
 CF = "/client/v4/user/tokens"
@@ -45,7 +50,10 @@ class Providers:
 
     def __init__(self, canary: Canary) -> None:
         self.canary = canary
-        self.keys: dict[str, dict[str, Key]] = {"cloudflare": {}, "resend": {}, "github": {}}
+        self.keys: dict[str, dict[str, Key]] = {
+            p: {} for p in ("cloudflare", "resend", "github", "twilio", "railway", "github-app")
+        }
+        self.railway_lists_ids = True  # projectTokens answers with each token's id
         self.calls: list[tuple[str, str]] = []
         self.fails: dict[tuple[str, str], int] = {}
         self.minted: list[str] = []
@@ -93,8 +101,15 @@ class Providers:
             return Answer(status, json.dumps(body))
         auth = headers.get("Authorization", "")
         token = auth.removeprefix("Bearer ") if auth.startswith("Bearer ") else ""
+        if parts.hostname == "api.twilio.com":
+            return self._twilio(method, parts.path, auth, parse_qs((data or b"").decode()))
         body_in: dict[str, Any] = json.loads(data) if data else {}
         self.last_body = body_in
+        if parts.hostname == "backboard.railway.com":
+            project = headers.get("Project-Access-Token", "")
+            return self._railway(token, project, body_in)
+        if parts.hostname == "api.github.com" and parts.path == "/app":
+            return self._github_app(token)
         if parts.hostname == "api.cloudflare.com":
             return self._cloudflare(method, parts.path, token, body_in)
         if parts.hostname == "api.resend.com":
@@ -192,6 +207,98 @@ class Providers:
             headers = {"github-authentication-token-expiration": f"{me.expires} 08:00:00 UTC"}
             return Answer(200, json.dumps({"resources": {}}), headers=headers)
         return Answer(404, "{}")
+
+    # ------------------------------------------------------------------ Twilio
+
+    def _twilio(self, method: str, path: str, auth: str, form: dict[str, list[str]]) -> Answer:
+        keys = self.keys["twilio"]
+        try:
+            sid, _, secret = base64.b64decode(auth.removeprefix("Basic ")).decode().partition(":")
+        except ValueError:
+            sid, secret = "", ""
+        me = keys.get(secret)
+        if me is None or me.ident != sid:
+            return Answer(401, json.dumps({"code": 20003, "status": 401}))
+        parts = path.split("/")  # /2010-04-01/Accounts/<account>[.json|/Keys...]
+        if method == "GET" and len(parts) == 4:
+            return Answer(200, json.dumps({"sid": parts[3].removesuffix(".json")}))
+        if not me.can_mint:
+            return Answer(401, json.dumps({"code": 70004, "status": 401}))
+        if method == "POST" and path.endswith("/Keys.json"):
+            value = made_up("tw")
+            key = Key(f"SK{len(self.minted) + 1:032d}", name=form.get("FriendlyName", [""])[0])
+            keys[value] = key
+            self.minted.append(value)
+            self.canary.watch(value)
+            return Answer(201, json.dumps({"sid": key.ident, "secret": value}))
+        if method == "DELETE" and "/Keys/" in path:
+            ident = path.rsplit("/", 1)[1].removesuffix(".json")
+            if self.by_id("twilio", ident) is None:
+                return Answer(404, json.dumps({"code": 20404, "status": 404}))
+            if not self.ignore_revoke:
+                del keys[self.value_of("twilio", ident)]
+            return Answer(204, "")
+        return Answer(405, "{}")
+
+    # ------------------------------------------------------------------ Railway
+
+    def _railway(self, token: str, project: str, body: dict[str, Any]) -> Answer:
+        keys = self.keys["railway"]
+        query = str(body.get("query", ""))
+        variables: dict[str, Any] = body.get("variables") or {}
+        denied = json.dumps({"errors": [{"message": "Not Authorized"}], "data": None})
+        if project:
+            me = keys.get(project)
+            if me is None or me.can_mint:  # a workspace token is not a project token
+                return Answer(200, denied)
+            return Answer(200, json.dumps({"data": {"projectToken": {"projectId": "p"}}}))
+        me = keys.get(token)
+        if me is None or not me.can_mint:
+            return Answer(200, denied)
+        if query.startswith("query { projects"):
+            return Answer(200, json.dumps({"data": {"projects": {"edges": []}}}))
+        if "projectTokens(" in query:
+            edges = [
+                {"node": {"id": k.ident, "name": k.name} if self.railway_lists_ids else {}}
+                for k in keys.values()
+                if not k.can_mint
+            ]
+            return Answer(200, json.dumps({"data": {"projectTokens": {"edges": edges}}}))
+        if "projectTokenCreate" in query:
+            value = made_up("rw")
+            made: dict[str, Any] = variables["i"]
+            key = Key(f"tok-new-{len(self.minted) + 1}", name=str(made["name"]))
+            key.policies = [made]
+            keys[value] = key
+            self.minted.append(value)
+            self.canary.watch(value)
+            return Answer(200, json.dumps({"data": {"projectTokenCreate": value}}))
+        if "projectTokenDelete" in query:
+            found = self.by_id("railway", str(variables.get("id", "")))
+            if found is None:
+                return Answer(200, json.dumps({"errors": [{"message": "Not Found"}]}))
+            if not self.ignore_revoke:
+                del keys[self.value_of("railway", found.ident)]
+            return Answer(200, json.dumps({"data": {"projectTokenDelete": True}}))
+        return Answer(400, "{}")
+
+    # ------------------------------------------------------------------ GitHub Apps
+
+    def _github_app(self, token: str) -> Answer:
+        """GET /app: 200 when the JWT is signed by a key the App still holds."""
+        try:
+            head, body, sig = token.split(".")
+            raw = base64.urlsafe_b64decode(sig + "=" * (-len(sig) % 4))
+        except ValueError:
+            return Answer(401, json.dumps({"message": "A JSON web token could not be decoded"}))
+        digest = hashlib.sha256(f"{head}.{body}".encode()).digest()
+        for pem in self.keys["github-app"]:
+            n, _ = appjwt._private(Secret(pem))  # pyright: ignore[reportPrivateUsage]
+            size = (n.bit_length() + 7) // 8
+            em = pow(int.from_bytes(raw, "big"), 65537, n).to_bytes(size, "big")
+            if em == appjwt.emsa_pkcs1_v15(digest, size):
+                return Answer(200, json.dumps({"slug": "the-app"}))
+        return Answer(401, json.dumps({"message": "Integration not found"}))
 
 
 def days(today: datetime.date, n: int) -> str:

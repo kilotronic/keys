@@ -1,8 +1,8 @@
 """The forms a value takes when it leaks: as sent, URL-encoded, JSON-escaped, base64, hex.
 
-Used to search for a known value (keys scan) and as the last-resort mask on text that came
-back from a service (keys check). Neither is the main defence: keys never passes a child's or a
-service's text through, only status and error codes it has checked.
+Used to search for a known value (keys scan, keys scrub) and to drop a service's error code
+that holds a piece of a key (keys check). Neither is the main defence: keys never passes a
+child's or a service's text through, only status and error codes it has checked.
 """
 
 from __future__ import annotations
@@ -72,11 +72,3 @@ def holds_piece(text: str, value: Secret) -> bool:
         return True
     raw = value.reveal().encode()
     return any(raw[i : i + PIECE] in data for i in range(len(raw) - PIECE + 1))
-
-
-def mask(text: str, value: Secret, marker: str = "<key>") -> str:
-    """text with every form of the value replaced by marker."""
-    data = text.encode()
-    for f in forms(value):
-        data = data.replace(f, marker.encode())
-    return data.decode(errors="replace")

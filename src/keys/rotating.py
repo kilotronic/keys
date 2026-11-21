@@ -33,7 +33,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
 
-from keys import files, listing, looks, mapping, probes, proc, rotators, targets
+from keys import appjwt, files, listing, looks, mapping, probes, proc, rotators, targets
 from keys.checking import fp_key_variable, read_fp_key
 from keys.context import EXIT_FAIL, EXIT_OK, EXIT_WAITING, Context, UsageError
 from keys.fingerprint import fingerprint
@@ -57,6 +57,7 @@ AWAITING, CREATED, STORED, VERIFIED, REVOKED = (
 STEPS = dict(
     enumerate(["preflight", "create", "probe", "store", "sync", "verify", "revoke", "record"], 1)
 )
+DOWNLOAD_LIMIT = 64 * 1024  # an RSA key's PEM is a few kB
 PROBE_TRIES = 3  # a fresh key can take a few seconds to authenticate
 PROBE_WAIT_S = 5
 RUN_LOOKS = 6  # looks for the run a dispatch started
@@ -159,7 +160,7 @@ class Rotation:
         self.send: rotators.Send = ctx.send or probes.send
         self.before: dict[tuple[str, ...], dict[str, targets.Present]] = {}
         self.fp_key = Secret("")
-        self.minter_value = Secret("")
+        self.grant = rotators.Grant(Secret(""))
         self.item: dict[str, Any] = {}
         self.deployed: set[tuple[str, ...]] = set()  # Railway scopes redeployed with the new key
         self.ran: list[str] = []  # workflows dispatched with the new key
@@ -171,6 +172,10 @@ class Rotation:
 
     def fp(self, value: Secret) -> str:
         return fingerprint(self.fp_key, value)
+
+    @property
+    def minter_value(self) -> Secret:
+        return self.grant.value
 
     def api(self, *values: Secret) -> rotators.Api:
         """The provider client; an error code holding a piece of any key in play (the minting
@@ -239,17 +244,34 @@ class Rotation:
         if PLAIN_ID.fullmatch(item_id) and PLAIN_ID.fullmatch(vault_id):
             self.open(f"onepassword://view-item/?v={vault_id}&i={item_id}", "the 1Password item")
 
-    def probe(self, value: Secret) -> tuple[str, str, probes.Answer]:
-        provider = probes.PROVIDERS[self.rot.probe]
+    def options(self, key_id: str) -> probes.Options | None:
+        """What the probe needs besides the key (its id, the account), or None when the item
+        does not hold it plainly."""
+        try:
+            return self.rot.probe_options(self.fields(), key_id)
+        except rotators.RotateError:
+            return None
+
+    def probe_once(self, value: Secret, key_id: str = "") -> tuple[str, str, probes.Answer]:
+        opts = self.options(key_id)
+        if opts is None:
+            return probes.UNKNOWN, "the item's ids are not plain ids", probes.Answer(0, "")
+        return probes.check_answer(probes.PROVIDERS[self.rot.probe], value, opts, self.send)
+
+    def probe(self, value: Secret, key_id: str = "") -> tuple[str, str, probes.Answer]:
         verdict, reason, answer = "", "", probes.Answer(0, "")
         for attempt in range(PROBE_TRIES):
-            verdict, reason, answer = probes.check_answer(
-                provider, value, probes.Options(), self.send
-            )
+            verdict, reason, answer = self.probe_once(value, key_id)
             if verdict == probes.WORKS or attempt == PROBE_TRIES - 1:
                 break
             self.ctx.sleep(PROBE_WAIT_S)
         return verdict, reason, answer
+
+    def revoke_page(self) -> str:
+        try:
+            return self.rot.revoke_url(self.c, self.fields())
+        except rotators.RotateError:
+            return ""
 
     # ------------------------------------------------------------------ 1 preflight
 
@@ -352,9 +374,14 @@ class Rotation:
         self.reload()
         if self.minter:
             try:
-                self.minter_value = self.op.read(self.minter.value_ref)
+                item = self.op.item_get(self.minter.vault, self.minter.item_title)
             except OpError as e:
                 raise UsageError(f"could not read {self.minter.name} from 1Password: {e}") from None
+            got = fields(item)
+            value = Secret(got.pop(self.minter.field, "").strip())
+            if not value:
+                raise UsageError(f"{self.minter.name}: its 1Password value is empty")
+            self.grant = rotators.Grant(value, got)
         f = self.fields()
         step = f.get(STEP, "")
         if not step and (f.get(PENDING) or f.get(PREVIOUS)):
@@ -375,10 +402,12 @@ class Rotation:
             else:
                 return self.ask_paste()
         elif step == AWAITING:
-            if not f.get(PENDING, "").strip():
+            took = not f.get(PENDING, "").strip() and self.take_download()
+            if not took and not self.fields().get(PENDING, "").strip():
                 self.ctx.say(f"{c.name}: 2 create: still waiting for the paste")
                 return self.ask_paste()
-            self.clear_clipboard()
+            if not took:
+                self.clear_clipboard()
             self.save(2, {STEP: CREATED})
         if self.fields().get(STEP) == CREATED:
             self.store(self.check_new())
@@ -417,7 +446,7 @@ class Rotation:
         """A new key an earlier rollback could not revoke goes before anything else."""
         try:
             key_id = rotators.ident(self.fields(), UNREVOKED_ID, [self.minter_value])
-            self.rot.revoke(self.api(), self.minter_value, key_id)
+            self.rot.revoke(self.api(), self.grant, self.fields(), key_id)
         except rotators.RotateError as e:
             if e.status != 404:
                 raise StepError(
@@ -434,9 +463,7 @@ class Rotation:
         if self.minter is None:  # run() refuses a mint kind without one
             raise StepError(2, "no minting credential")
         try:
-            new = self.rot.mint(
-                self.api(), self.minter_value, self.fields(), self.key_name, self.today
-            )
+            new = self.rot.mint(self.api(), self.grant, self.fields(), self.key_name, self.today)
         except rotators.RotateError as e:
             raise StepError(2, f"{e}; nothing was changed") from None
         values = {
@@ -453,6 +480,12 @@ class Rotation:
                 2, f"{str(e).split(': ', 1)[1]}; {gone}; nothing else changed"
             ) from None
         self.say(2, f"made {self.key_name!r} fp:{self.fp(new.value)}, saved as pending")
+        if self.rot.id_field and not new.ident:
+            self.say(
+                2,
+                f"note: the provider did not name its id; fill the item's {self.rot.id_field} "
+                "field by hand before the next rotation",
+            )
 
     def ask_paste(self) -> int:
         c = self.c
@@ -466,6 +499,13 @@ class Rotation:
         self.open_item()
         repos = sorted({r for a in self.ads for r in _repos(a)})
         say = self.ctx.say
+        if self.rot.download(self.fields()) is not None:
+            say(f"{c.name}: 2 create: waiting for you, in the browser:")
+            say("  on the page just opened, generate a private key; the browser saves it to")
+            say("  Downloads. Do not open the file: the next run moves it into the item's")
+            say("  pending field and deletes it")
+            say(f"  then run: keys rotate {c.name}")
+            return EXIT_WAITING
         say(f"{c.name}: 2 create: waiting for you, in the browser and 1Password:")
         say(f"  make the new key on the page just opened: {self.key_name!r}, 180 days or less")
         if repos:
@@ -475,6 +515,48 @@ class Rotation:
         say("  Clipboard off meanwhile")
         say(f"  then run: keys rotate {c.name}")
         return EXIT_WAITING
+
+    def take_download(self) -> bool:
+        """For a key the provider hands out only as a file (a GitHub App key): the one file of
+        its name in ~/Downloads moved into the item's pending field, then deleted, so no copy
+        stays on disk. Its content is never printed; neither is anything but a count."""
+        pattern = self.rot.download(self.fields())
+        home = self.environ.get("HOME", "")
+        if pattern is None or not home:
+            return False
+        folder = Path(home) / "Downloads"
+        try:
+            found = [p for p in folder.iterdir() if pattern.fullmatch(p.name) and p.is_file()]
+        except OSError:
+            return False
+        if not found:
+            return False
+        if len(found) > 1:
+            raise StepError(
+                2,
+                f"{len(found)} downloaded keys for this App are in Downloads; delete all but the "
+                "newest (keys reads none of them), then rerun",
+            )
+        path = found[0]
+        try:
+            if path.stat().st_size > DOWNLOAD_LIMIT:
+                raise OSError
+            text = Secret(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise StepError(2, "could not read the downloaded key; delete it, then rerun") from None
+        if not appjwt.is_rsa_key(text):
+            raise StepError(
+                2, "the downloaded file is not an RSA private key; delete it, then rerun"
+            )
+        self.save(2, {PENDING: text.reveal()}, "the downloaded key is still in Downloads")
+        del text
+        try:
+            path.unlink()
+        except OSError:
+            self.say(2, "moved the downloaded key into pending; delete the file in Downloads")
+            return True
+        self.say(2, "moved the downloaded key into the item's pending field and deleted the file")
+        return True
 
     def clear_clipboard(self) -> None:
         try:
@@ -488,7 +570,7 @@ class Rotation:
         """Probe the pending key; its expiry (ISO date or empty) when it passes."""
         f = self.fields()
         value = targets.normalise(Secret(f.get(PENDING, "")), self.c.name)
-        verdict, reason, answer = self.probe(value)
+        verdict, reason, answer = self.probe(value, f.get(PENDING_ID, ""))
         problem = ""
         expires = self.expires_field(3)
         if verdict == probes.UNKNOWN:
@@ -554,26 +636,58 @@ class Rotation:
 
     # ------------------------------------------------------------------ 5 sync, 6 verify
 
+    def delivered(self, a: targets.Adapter, old: bool) -> Secret:
+        """What target a receives: the key, or (with `field = ...`) a non-secret field of the
+        item, such as a Twilio key's SID; the old one's or the new one's."""
+        f, c = self.fields(), self.c
+        name = a.target.field
+        if not name:
+            return targets.normalise(Secret(f.get(PREVIOUS if old else c.field, "")), c.name)
+        if old and name == self.rot.id_field:
+            return Secret(f.get(PREVIOUS_ID, ""))
+        return Secret(f.get(name, ""))
+
     def sync_and_verify(self) -> None:
-        f = self.fields()
-        new = targets.normalise(Secret(f[self.c.field]), self.c.name)
-        fp = self.fp(new)
         written: list[targets.Adapter] = []
-        for a in self.ads:
+        fps: dict[int, str] = {}
+        for i, a in enumerate(self.ads):
+            value = self.delivered(a, old=False)
+            if not value:
+                self.rollback(5, a, f"the item's {a.target.field} field is empty", written)
+            fps[i] = fp = self.fp(value)
             # Counted before the write: one that failed may still have landed (a timeout), and
             # writing the old key back to a target that never changed does no harm.
             written.append(a)
             try:
-                a.write(new, fp)
+                a.write(value, fp)
             except targets.TargetError as e:
                 self.rollback(5, a, str(e), written)
             self.say(5, f"{a.describe()} fp:{fp}")
-        # A workflow runs with the new key and may deploy it, so it goes last: a failure
-        # elsewhere rolls back before anything was dispatched.
-        later = [a for a in self.ads if a.target.verify.get("workflow")]
-        for a in [a for a in self.ads if a not in later] + later:
+        # Each Railway service is redeployed once, after its variables read back right; a
+        # workflow runs with the new key and may deploy it, so it goes last: a failure elsewhere
+        # rolls back before anything was dispatched.
+        later = [i for i, a in enumerate(self.ads) if a.target.verify.get("workflow")]
+        order = [i for i in range(len(self.ads)) if i not in later]
+        services: dict[tuple[str, ...], targets.Railway] = {}
+        for i in order:
+            a = self.ads[i]
             try:
-                self.verify(a, fp)
+                self.verify(a, fps[i])
+            except targets.TargetError as e:
+                self.rollback(6, a, str(e), written)
+            if isinstance(a, targets.Railway):
+                services.setdefault(a.scope(), a)
+        for a in services.values():
+            try:
+                a.redeploy(self.ctx.sleep)
+            except targets.TargetError as e:
+                self.rollback(6, a, str(e), written)
+            self.deployed.add(a.scope())
+            self.say(6, f"{a.service_label()} deployed")
+        for i in later:
+            a = self.ads[i]
+            try:
+                self.verify(a, fps[i])
             except targets.TargetError as e:
                 self.rollback(6, a, str(e), written)
             except StepError as e:
@@ -582,9 +696,12 @@ class Rotation:
 
     def verify(self, a: targets.Adapter, fp: str) -> None:
         if isinstance(a, targets.Railway):
-            a.redeploy(self.ctx.sleep)
-            self.deployed.add(a.scope())
-            self.say(6, f"{a.describe()} deployed")
+            value = a.read()  # in memory; only its fingerprint is kept
+            got = self.fp(Secret(value.reveal().rstrip("\n"))) if value is not None else ""
+            del value
+            if got != fp:
+                raise targets.TargetError("the variable does not read back as the new key")
+            self.say(6, f"{a.describe()} reads back fp:{fp}")
             return
         now = a.listing().get(a.name)
         if now is None:
@@ -658,10 +775,12 @@ class Rotation:
         notes: list[str] = []
         if old:
             for a in written:
+                back = self.delivered(a, old=True)
                 try:
-                    a.write(old, fp_old)
+                    a.write(back, self.fp(back))
                 except targets.TargetError:
-                    if a is not at or self.landed(a, self.fp(new)) is not False:
+                    sent = self.fp(self.delivered(a, old=False))
+                    if a is not at or self.landed(a, sent) is not False:
                         stuck.append(a.describe())
             for a in {a.scope(): a for a in written if isinstance(a, targets.Railway)}.values():
                 try:
@@ -735,15 +854,16 @@ class Rotation:
         """Revoke a new key that will not be used; what happened, as a phrase."""
         if self.rot.revokes_by_api and key_id:
             try:
-                self.rot.revoke(self.api(value), self.minter_value, key_id)
+                self.rot.revoke(self.api(value), self.grant, self.fields(), key_id)
             except rotators.RotateError as e:
                 return (
                     f"the new key could not be revoked ({e}): the next keys rotate revokes it, "
                     f"or delete {self.key_name!r} by hand"
                 )
             return REVOKED_NEW
-        if self.rot.revoke_page:
-            self.open(self.rot.revoke_page, "the page to revoke the new key")
+        page = self.revoke_page()
+        if page:
+            self.open(page, "the page to revoke the new key")
         return f"delete the new key {self.key_name!r} on the page just opened"
 
     def revoke_old(self) -> bool:
@@ -753,7 +873,7 @@ class Rotation:
         new = targets.normalise(Secret(f.get(self.c.field, "")), self.c.name)
         # The new key is what every target holds now; if it stopped working (the owner deleted
         # the wrong one), the old one must not go too.
-        verdict, reason, _ = self.probe(new)
+        verdict, reason, _ = self.probe(new, f.get(self.rot.id_field, ""))
         if verdict != probes.WORKS:
             raise StepError(
                 7,
@@ -770,19 +890,17 @@ class Rotation:
         )
         if self.rot.revokes_by_api:
             # A rerun after a revoke that went through, but was not recorded, finds it dead.
-            verdict, reason, _ = probes.check_answer(
-                probes.PROVIDERS[self.rot.probe], old, probes.Options(), self.send
-            )
+            verdict, reason, _ = self.probe_once(old, f.get(PREVIOUS_ID, ""))
             if verdict != probes.DEAD:
                 try:
                     key_id = rotators.ident(f, PREVIOUS_ID, [old, self.minter_value])
-                    self.rot.revoke(self.api(old), self.minter_value, key_id)
+                    self.rot.revoke(self.api(old), self.grant, f, key_id)
                 except rotators.RotateError as e:
                     if e.status != 404:  # 404: already gone; the probe below says so
                         raise StepError(
                             7, f"the old key fp:{fp_old} was not revoked: {e}; {keep}"
                         ) from None
-                verdict, reason, _ = self.probe_dead(old)
+                verdict, reason, _ = self.probe_dead(old, f.get(PREVIOUS_ID, ""))
             if verdict == probes.UNKNOWN:
                 raise StepError(
                     7, f"cannot tell whether the old key fp:{fp_old} is dead ({reason}); {keep}"
@@ -792,11 +910,9 @@ class Rotation:
                     7, f"the old key fp:{fp_old} still works after the revoke ({reason}); {keep}"
                 )
         else:
-            verdict, reason, _ = probes.check_answer(
-                probes.PROVIDERS[self.rot.probe], old, probes.Options(), self.send
-            )
+            verdict, reason, _ = self.probe_once(old, f.get(PREVIOUS_ID, ""))
             if verdict == probes.WORKS:
-                self.open(self.rot.revoke_page, "the page to revoke the old key")
+                self.open(self.revoke_page(), "the page to revoke the old key")
                 self.ctx.say(
                     f"{self.c.name}: 7 revoke: waiting for you: delete the old key (the one not "
                     f"named {self.key_name!r}) on the page just opened, then run: keys rotate "
@@ -811,11 +927,10 @@ class Rotation:
         self.say(7, f"the old key fp:{fp_old} is refused now ({reason})")
         return False
 
-    def probe_dead(self, value: Secret) -> tuple[str, str, probes.Answer]:
-        provider = probes.PROVIDERS[self.rot.probe]
+    def probe_dead(self, value: Secret, key_id: str = "") -> tuple[str, str, probes.Answer]:
         got = ("", "", probes.Answer(0, ""))
         for attempt in range(PROBE_TRIES):
-            got = probes.check_answer(provider, value, probes.Options(), self.send)
+            got = self.probe_once(value, key_id)
             if got[0] == probes.DEAD or attempt == PROBE_TRIES - 1:
                 break
             self.ctx.sleep(PROBE_WAIT_S)

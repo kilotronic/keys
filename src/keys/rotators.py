@@ -1,8 +1,9 @@
 """What each kind needs from its provider to rotate: mint, revoke, probe and its pages.
 
 A rung-3 kind mints the new key by API with another credential's key (`minted_by`) and revokes
-the old one the same way. A paste kind (rung 4) has no create API: keys opens the provider's
-pre-filled page, and the owner pastes the new value into the 1Password item.
+the old one the same way. A paste kind (rungs 4 and 5) has no create API: keys opens the
+provider's page, and the owner pastes the new value into the 1Password item (a GitHub App key,
+which GitHub hands out only as a download, keys moves from the download into the item itself).
 
 Every request goes through keys's own HTTPS client with the key in a header it builds. An error
 names the host, a fixed path (never an id taken from the item), the HTTP status and the
@@ -11,6 +12,7 @@ provider's error code, and only when that code holds no piece of a key.
 
 from __future__ import annotations
 
+import base64
 import datetime
 import json
 import re
@@ -38,6 +40,14 @@ class RotateError(Exception):
 
 
 @dataclass(frozen=True)
+class Grant:
+    """A key that acts for keys (the minting key): its value and its item's other fields."""
+
+    value: Secret
+    fields: dict[str, str] = field(default_factory=lambda: dict[str, str]())
+
+
+@dataclass(frozen=True)
 class Minted:
     value: Secret
     ident: str
@@ -58,15 +68,28 @@ class Api:
         shown: str,
         token: Secret,
         body: dict[str, Any] | None = None,
+        *,
+        basic: str = "",
+        form: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        """The call, signed in with token as a bearer, or with `basic` as the user name and
+        token as the password (Twilio); a JSON body, or a form."""
         parts = urllib.parse.urlsplit(url)
         if parts.scheme != "https":
             raise RotateError("keys sends a key only over https")
-        headers = {"Authorization": f"Bearer {token.reveal()}", "Accept": "application/json"}
+        if basic:
+            pair = base64.b64encode(f"{basic}:{token.reveal()}".encode()).decode()
+            auth = f"Basic {pair}"
+        else:
+            auth = f"Bearer {token.reveal()}"
+        headers = {"Authorization": auth, "Accept": "application/json"}
         data = None
         if body is not None:
             headers["Content-Type"] = "application/json"
             data = json.dumps(body).encode()
+        elif form is not None:
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+            data = urllib.parse.urlencode(form).encode()
         answer = self.send(method, url, headers, data)
         where = f"{parts.hostname}{shown}"
         if answer.status == 0:
@@ -108,11 +131,11 @@ class Rotator:
     fields: dict[str, str] = field(default_factory=lambda: dict[str, str]())
 
     def mint(
-        self, api: Api, minter: Secret, fields: dict[str, str], name: str, today: datetime.date
+        self, api: Api, minter: Grant, fields: dict[str, str], name: str, today: datetime.date
     ) -> Minted:
         raise NotImplementedError
 
-    def revoke(self, api: Api, minter: Secret, key_id: str) -> None:
+    def revoke(self, api: Api, minter: Grant, fields: dict[str, str], key_id: str) -> None:
         raise NotImplementedError
 
     @property
@@ -122,8 +145,22 @@ class Rotator:
     def create_page(self, c: mapping.Credential, fields: dict[str, str], name: str) -> str:
         raise NotImplementedError
 
+    def revoke_url(self, c: mapping.Credential, fields: dict[str, str]) -> str:
+        """The page where the owner deletes a key, for a kind with no revoke API."""
+        return self.revoke_page
+
     def expiry(self, answer: probes.Answer) -> datetime.date | None:
         """The expiry the provider reports for a key, from its probe's answer."""
+        return None
+
+    def probe_options(self, fields: dict[str, str], key_id: str) -> probes.Options:
+        """What the probe needs besides the key: the key's own id (`key_id`, the one being
+        probed) or a field of the item. Checked: plain ids only."""
+        return probes.Options()
+
+    def download(self, fields: dict[str, str]) -> re.Pattern[str] | None:
+        """The name of the file the provider's page downloads the new key as, for a kind
+        handed out only as a file; None for a kind the owner pastes."""
         return None
 
 
@@ -137,10 +174,11 @@ class Cloudflare(Rotator):
     expires 180 days from today. Account-owned tokens are not handled yet."""
 
     def mint(
-        self, api: Api, minter: Secret, fields: dict[str, str], name: str, today: datetime.date
+        self, api: Api, minter: Grant, fields: dict[str, str], name: str, today: datetime.date
     ) -> Minted:
+        token = minter.value
         old_id = ident(fields, "token_id", api.secrets)
-        got = api.call("GET", f"{CF}/{old_id}", "/client/v4/user/tokens/<id>", minter)
+        got = api.call("GET", f"{CF}/{old_id}", "/client/v4/user/tokens/<id>", token)
         old = cast(dict[str, Any], got.get("result") or {})
         policies: list[dict[str, Any]] = []
         for raw in cast(list[Any], old.get("policies") or []):
@@ -169,15 +207,15 @@ class Cloudflare(Rotator):
         }
         if old.get("condition"):
             body["condition"] = old["condition"]
-        made = api.call("POST", CF, "/client/v4/user/tokens", minter, body)
+        made = api.call("POST", CF, "/client/v4/user/tokens", token, body)
         result = cast(dict[str, Any], made.get("result") or {})
         value, new_id = result.get("value"), result.get("id")
         if not isinstance(value, str) or not value or not isinstance(new_id, str):
             raise RotateError("Cloudflare's answer had no new token in it")
         return Minted(Secret(value), new_id, expires)
 
-    def revoke(self, api: Api, minter: Secret, key_id: str) -> None:
-        api.call("DELETE", f"{CF}/{key_id}", "/client/v4/user/tokens/<id>", minter)
+    def revoke(self, api: Api, minter: Grant, fields: dict[str, str], key_id: str) -> None:
+        api.call("DELETE", f"{CF}/{key_id}", "/client/v4/user/tokens/<id>", minter.value)
 
     def expiry(self, answer: probes.Answer) -> datetime.date | None:
         """The expiry Cloudflare reports in the verify answer, so the 180-day check reads what
@@ -207,18 +245,19 @@ def resend_mint_body(name: str, fields: dict[str, str]) -> dict[str, Any]:
 
 class Resend(Rotator):
     def mint(
-        self, api: Api, minter: Secret, fields: dict[str, str], name: str, today: datetime.date
+        self, api: Api, minter: Grant, fields: dict[str, str], name: str, today: datetime.date
     ) -> Minted:
         if fields.get("domain_id"):
             ident(fields, "domain_id", api.secrets)
-        made = api.call("POST", RESEND, "/api-keys", minter, resend_mint_body(name, fields))
+        body = resend_mint_body(name, fields)
+        made = api.call("POST", RESEND, "/api-keys", minter.value, body)
         value, new_id = made.get("token"), made.get("id")
         if not isinstance(value, str) or not value or not isinstance(new_id, str):
             raise RotateError("Resend's answer had no new key in it")
         return Minted(Secret(value), new_id)
 
-    def revoke(self, api: Api, minter: Secret, key_id: str) -> None:
-        api.call("DELETE", f"{RESEND}/{key_id}", "/api-keys/<id>", minter)
+    def revoke(self, api: Api, minter: Grant, fields: dict[str, str], key_id: str) -> None:
+        api.call("DELETE", f"{RESEND}/{key_id}", "/api-keys/<id>", minter.value)
 
 
 # ---------------------------------------------------------------------------- GitHub tokens
@@ -251,11 +290,177 @@ class GitHubPat(Rotator):
             return None
 
 
+# ---------------------------------------------------------------------------- Twilio
+
+TWILIO = "https://api.twilio.com/2010-04-01/Accounts"
+
+
+class Twilio(Rotator):
+    """A standard or restricted API key, minted and deleted with a Main key (the minted_by
+    credential: its own `key_sid` and secret), for the item's `account_sid`. The value is the
+    key's secret; its SID is the item's `key_sid` field, delivered by targets that say
+    `field = "key_sid"`."""
+
+    def _account(self, api: Api, fields: dict[str, str]) -> str:
+        return ident(fields, "account_sid", api.secrets)
+
+    def mint(
+        self, api: Api, minter: Grant, fields: dict[str, str], name: str, today: datetime.date
+    ) -> Minted:
+        account = self._account(api, fields)
+        main = ident(minter.fields, "key_sid", api.secrets)
+        made = api.call(
+            "POST",
+            f"{TWILIO}/{account}/Keys.json",
+            "/2010-04-01/Accounts/<account>/Keys.json",
+            minter.value,
+            basic=main,
+            form={"FriendlyName": name},
+        )
+        value, new_id = made.get("secret"), made.get("sid")
+        if not isinstance(value, str) or not value or not isinstance(new_id, str):
+            raise RotateError("Twilio's answer had no new key in it")
+        if not IDENT.fullmatch(new_id):
+            raise RotateError("Twilio's answer named the new key with something not an id")
+        return Minted(Secret(value), new_id)
+
+    def revoke(self, api: Api, minter: Grant, fields: dict[str, str], key_id: str) -> None:
+        account = self._account(api, fields)
+        main = ident(minter.fields, "key_sid", api.secrets)
+        api.call(
+            "DELETE",
+            f"{TWILIO}/{account}/Keys/{key_id}.json",
+            "/2010-04-01/Accounts/<account>/Keys/<id>.json",
+            minter.value,
+            basic=main,
+        )
+
+    def probe_options(self, fields: dict[str, str], key_id: str) -> probes.Options:
+        account = fields.get("account_sid", "")
+        if not IDENT.fullmatch(account) or not IDENT.fullmatch(key_id):
+            raise RotateError("the item's account_sid or key SID is not a plain id")
+        return probes.Options(user=key_id, account=account)
+
+
+# ---------------------------------------------------------------------------- Railway
+
+RAILWAY = "https://backboard.railway.com/graphql/v2"
+RAILWAY_TOKENS = "https://railway.com/account/tokens"
+TOKENS_QUERY = "query($p: String!) { projectTokens(projectId: $p) { edges { node { id name } } } }"
+CREATE = "mutation($i: ProjectTokenCreateInput!) { projectTokenCreate(input: $i) }"
+DELETE = "mutation($id: String!) { projectTokenDelete(id: $id) }"
+
+
+class RailwayProject(Rotator):
+    """A project token for one environment, minted and deleted with a workspace token (the
+    minted_by credential), for the item's `project_id` and `environment_id`. Railway documents
+    neither mutation, so they are read from its public GraphQL schema. Project tokens have no
+    expiry, so the rotation date counts."""
+
+    def _gql(self, api: Api, minter: Grant, query: str, variables: dict[str, Any]) -> Any:
+        doc = api.call(
+            "POST", RAILWAY, "/graphql/v2", minter.value, {"query": query, "variables": variables}
+        )
+        if doc.get("errors") or not isinstance(doc.get("data"), dict):
+            raise RotateError("Railway refused the call (backboard.railway.com/graphql/v2)")
+        return doc["data"]
+
+    def _named(self, api: Api, minter: Grant, project: str, name: str) -> list[str]:
+        data = self._gql(api, minter, TOKENS_QUERY, {"p": project})
+        tokens = cast(dict[str, Any], cast(dict[str, Any], data).get("projectTokens") or {})
+        ids: list[str] = []
+        for e in cast(list[Any], tokens.get("edges") or []):
+            raw = cast(dict[str, Any], e).get("node") if isinstance(e, dict) else None
+            node = cast(dict[str, Any], raw) if isinstance(raw, dict) else {}
+            if node.get("name") == name and isinstance(node.get("id"), str):
+                ids.append(cast(str, node["id"]))
+        return ids
+
+    def mint(
+        self, api: Api, minter: Grant, fields: dict[str, str], name: str, today: datetime.date
+    ) -> Minted:
+        project = ident(fields, "project_id", api.secrets)
+        environment = ident(fields, "environment_id", api.secrets)
+        if self._named(api, minter, project, name):
+            raise RotateError(
+                f"a project token named {name!r} is there already: delete it in Railway, "
+                "or rotate tomorrow"
+            )
+        variables = {"i": {"name": name, "projectId": project, "environmentId": environment}}
+        value = self._gql(api, minter, CREATE, variables).get("projectTokenCreate")
+        if not isinstance(value, str) or not value:
+            raise RotateError("Railway's answer had no new token in it")
+        new = Secret(value)
+        try:
+            found = self._named(api, minter, project, name)
+        except RotateError:
+            found = []
+        # Without its id the token can still be used; only its revoke waits for the owner.
+        return Minted(new, found[0] if len(found) == 1 and IDENT.fullmatch(found[0]) else "")
+
+    def revoke(self, api: Api, minter: Grant, fields: dict[str, str], key_id: str) -> None:
+        if self._gql(api, minter, DELETE, {"id": key_id}).get("projectTokenDelete") is not True:
+            raise RotateError("Railway did not confirm the delete")
+
+
+class RailwayWorkspace(Rotator):
+    """A workspace (or account) token: only the dashboard makes and deletes one."""
+
+    def create_page(self, c: mapping.Credential, fields: dict[str, str], name: str) -> str:
+        return RAILWAY_TOKENS
+
+
+# ---------------------------------------------------------------------------- GitHub App keys
+
+APP_SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,33}")
+
+
+class GitHubAppKey(Rotator):
+    """An App's private key. GitHub makes one only on the App's page, as a download, and
+    deletes one only there; it allows 25 at once, so the new key works before the old one
+    goes. keys moves the downloaded file into the item's pending field and deletes it."""
+
+    def _page(self, c: mapping.Credential, fields: dict[str, str]) -> str:
+        slug = fields.get("slug", "")
+        if not APP_SLUG.fullmatch(slug):
+            raise RotateError("github-app-key needs the item's slug field: the App's URL name")
+        owner = c.owner
+        if owner and (not OWNER.fullmatch(owner) or looks.looks_like_value(owner)):
+            raise RotateError("github-app-key: owner must be the org that owns the App")
+        if owner:
+            return f"https://github.com/organizations/{owner}/settings/apps/{slug}"
+        return f"https://github.com/settings/apps/{slug}"
+
+    def create_page(self, c: mapping.Credential, fields: dict[str, str], name: str) -> str:
+        return self._page(c, fields)
+
+    def revoke_url(self, c: mapping.Credential, fields: dict[str, str]) -> str:
+        return self._page(c, fields)
+
+    def probe_options(self, fields: dict[str, str], key_id: str) -> probes.Options:
+        issuer = fields.get("client_id") or fields.get("app_id") or ""
+        if not IDENT.fullmatch(issuer.replace(".", "-")):
+            raise RotateError("github-app-key needs the item's client_id (or app_id) field")
+        return probes.Options(client_id=issuer)
+
+    def download(self, fields: dict[str, str]) -> re.Pattern[str] | None:
+        slug = fields.get("slug", "")
+        if not APP_SLUG.fullmatch(slug):
+            return None
+        return re.compile(
+            rf"{re.escape(slug)}\.\d{{4}}-\d{{2}}-\d{{2}}\.private-key( \(\d+\))?\.pem"
+        )
+
+
 ROTATORS: dict[str, Rotator] = {
     r.kind: r
     for r in [
         Cloudflare("cloudflare-token", "cloudflare", id_field="token_id", mints=True),
         Resend("resend-key", "resend", id_field="key_id", mints=True),
         GitHubPat("github-pat", "github", revoke_page=PAT_LIST),
+        Twilio("twilio-key", "twilio", id_field="key_sid", mints=True),
+        RailwayProject("railway-project-token", "railway-project", id_field="token_id", mints=True),
+        RailwayWorkspace("railway-workspace-token", "railway", revoke_page=RAILWAY_TOKENS),
+        GitHubAppKey("github-app-key", "github-app"),
     ]
 }

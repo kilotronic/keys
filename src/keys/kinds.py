@@ -24,14 +24,20 @@ class Kind:
 KINDS: dict[str, Kind] = {
     k.name: k
     for k in [
-        Kind("github-app-key", "a GitHub App's private key", ("app_id", "client_id")),
+        Kind("github-app-key", "a GitHub App's private key", ("app_id", "client_id", "slug")),
         Kind(
             "github-pat",
             "a GitHub fine-grained personal access token",
             ("owner",),
             can_expire=True,
         ),
-        Kind("railway-project-token", "a Railway project token", ("project_id", "environment")),
+        Kind(
+            "railway-project-token",
+            "a Railway project token",
+            ("project_id", "environment_id", "token_id"),
+        ),
+        Kind("railway-workspace-token", "a Railway workspace or account token"),
+        Kind("twilio-key", "a Twilio API key (its secret)", ("key_sid", "account_sid")),
         Kind(
             "cloudflare-token",
             "a Cloudflare API token",

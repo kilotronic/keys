@@ -287,7 +287,7 @@ def test_an_unreachable_target_stops_it(cf: tuple[Canary, Providers]) -> None:
 
 def test_an_unreadable_minting_key_stops_it(cf: tuple[Canary, Providers]) -> None:
     c, p = cf
-    c.op_fail(f"op://{VAULT}/{MINTER_ITEM}/credential", code=6)
+    c.child_fails(["op", "item", "get", MINTER_ITEM], code=6)
     result = rotate(c, p, "deploy")
     assert result.code == 3
     assert "op exited 6" in result.stderr
