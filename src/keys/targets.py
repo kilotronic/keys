@@ -283,6 +283,14 @@ class Railway(Adapter):
         del rows
         return {n: Present(n) for n in names}
 
+    def delete(self) -> None:
+        """Remove this variable. Railway has no --skip-deploys for a delete, so it may deploy;
+        a redeploy after it waits for that to settle."""
+        self._run(
+            "deleting the variable",
+            ["railway", "variable", "delete", self.name, *self._scope_flags()],
+        )
+
     def read(self) -> Secret | None:
         """This variable's value, read in process (keys check --deep); None when it is not set.
         The other variables' values in the same listing are dropped at once."""
@@ -292,7 +300,7 @@ class Railway(Adapter):
         del rows
         return Secret(found) if isinstance(found, str) else None
 
-    def _latest(self) -> tuple[str, str]:
+    def latest(self) -> tuple[str, str]:
         argv = ["railway", "deployment", "list", *self._scope_flags(), "--json"]
         rows = self._json("listing deployments", self._run("listing deployments", argv))
         try:
@@ -305,18 +313,18 @@ class Railway(Adapter):
 
     def redeploy(self, sleep: Callable[[float], None] = time.sleep) -> None:
         """Redeploy and wait for the new deployment to succeed, told from the old by its id."""
-        previous, status = self._latest()
+        previous, status = self.latest()
         for _ in range(DEPLOY_ATTEMPTS):  # Railway refuses to redeploy one still in flight
             if status not in IN_PROGRESS:
                 break
             sleep(DEPLOY_WAIT_S)
-            previous, status = self._latest()
+            previous, status = self.latest()
         else:
             raise TargetError(f"{self.service_label()}: the last deployment never finished")
         self._run("redeploying", ["railway", "redeploy", *self._scope_flags(), "--yes"])
         self.requested = True  # from here the new deployment may go live, even if it fails
         for _ in range(DEPLOY_ATTEMPTS):
-            ident, status = self._latest()
+            ident, status = self.latest()
             if ident != previous and status not in IN_PROGRESS:
                 if status not in SUCCEEDED:
                     shown = status if re.fullmatch(r"[A-Z_]{1,20}", status) else "unknown"

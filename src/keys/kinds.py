@@ -19,6 +19,9 @@ class Kind:
     # The provider keeps one key at a time (a roll in place), so rotating it means a short
     # outage: keys rotate refuses it without --now.
     single_key: bool = False
+    # The app owns it and it lives only at its targets (a signing key, a datastore password):
+    # no 1Password item; keys rotate makes the new value itself.
+    runtime: bool = False
 
 
 KINDS: dict[str, Kind] = {
@@ -50,5 +53,17 @@ KINDS: dict[str, Kind] = {
             ("key_id", "domain_id", "permission"),
         ),
         Kind("generic", "any other credential", (), provider_issued=False),
+        Kind(
+            "generated",
+            "a random secret the app owns (a signing key), kept only at its targets",
+            provider_issued=False,
+            runtime=True,
+        ),
+        Kind(
+            "postgres-password",
+            "a Postgres password, changed in the database first, kept only at its targets",
+            provider_issued=False,
+            runtime=True,
+        ),
     ]
 }

@@ -32,6 +32,7 @@ from typing import Any
 
 from keys import forms, listing, looks
 from keys.context import EXIT_FAIL, EXIT_OK, EXIT_UNKNOWN, Context, UsageError
+from keys.kinds import KINDS
 from keys.op import Op, OpError
 from keys.secret import Secret
 
@@ -240,6 +241,8 @@ def searcher(
         m = listing.load(args, ctx)
         op = Op(ctx.environ)
         for c in m.credentials:
+            if KINDS[c.kind].runtime:  # no 1Password value; found by the pattern pass only
+                continue
             try:
                 value = op.read(c.value_ref)
             except OpError as e:
