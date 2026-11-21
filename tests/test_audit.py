@@ -105,7 +105,7 @@ def test_all_clean_needs_no_1password_and_skips_railway(c: Canary) -> None:
     assert "github-actions owner/app MAIL_KEY  present" in out
     assert "azure-key-vault app-kv mail-key  present, fingerprint tag matches" in out
     assert "railway app/production MAIL_API_KEY  skipped: Railway is checked with --deep" in out
-    assert "keys check --all: 1 credential, 5 targets, no problems" in out
+    assert "keys check --all: 1 credential, 5 targets (1 skipped), no problems" in out
 
 
 def test_a_missing_target_fails(c: Canary) -> None:
@@ -191,6 +191,7 @@ def test_all_through_a_real_shell(c: Canary) -> None:
     write_mapping(c)
     all_present(c)
     result = c.shell("keys check --all", env=ENV)
+    assert result.code == 0, result.stdout + result.stderr
     assert "present" in result.stdout
     assert not [ch for ch in c.children() if ch.prog == "op"]
 
@@ -269,6 +270,7 @@ def test_deep_through_a_real_shell(c: Canary) -> None:
     all_present(c)
     c.op_items([tagged("generic app-mail", "2026-11-01T00:00:00Z")])
     result = c.shell("keys check --deep", env=ENV)
+    assert result.code == 0, result.stdout + result.stderr
     assert "value matches 1Password" in result.stdout
 
 
@@ -282,14 +284,244 @@ def tagged(title: str, updated: str) -> dict[str, object]:
     }
 
 
+# ---------------------------------------------------------------------------- review fixes
+
+GH_ONLY = """
+[[credential.target]]
+type = "github-actions"
+repo = "owner/app"
+secret = "mail_key"
+"""
+
+
+def test_github_names_compare_without_case(c: Canary) -> None:
+    write_mapping(c, body=GH_ONLY, extra_top='ignore_unmapped = ["stray_token"]\n\n')
+    c.target_put("gh:owner/app:MAIL_KEY", CANARY, updated_at="2026-11-02T00:00:00Z")
+    c.target_put("gh:owner/app:STRAY_TOKEN", OTHER)
+    code, out, _ = check(c)
+    assert code == 0, out
+    assert "MAIL_KEY: not in the mapping file" not in out
+    assert "github-actions owner/app mail_key  present" in out
+
+
+def test_key_vault_names_compare_without_case(c: Canary) -> None:
+    body = (
+        '[[credential.target]]\ntype = "azure-key-vault"\nvault = "app-kv"\nsecret = "Mail-Key"\n'
+    )
+    write_mapping(c, body=body)
+    c.target_put("az:app-kv:mail-key", CANARY, tags={"keys-fp": FP})
+    code, out, _ = check(c)
+    assert code == 0, out
+
+
+def test_a_github_secret_with_no_date_or_a_credential_with_no_rotation_fails(c: Canary) -> None:
+    write_mapping(c, body=GH_ONLY)
+    c.target_put("gh:owner/app:MAIL_KEY", CANARY, updated_at="")
+    code, out, _ = check(c)
+    assert code == 1
+    assert "mail_key  present, but GitHub gives no update date to compare" in out
+    (c.work / "keys.toml").write_text(
+        f'[[credential]]\nname = "app-mail"\nkind = "generic"\nitem = "{ITEM}"\n'
+        'kept_because = "no OIDC"\n' + GH_ONLY
+    )
+    c.target_put("gh:owner/app:MAIL_KEY", CANARY, updated_at="2026-11-02T00:00:00Z")
+    code, out, _ = check(c)
+    assert code == 1
+    assert "mail_key  present, but no rotation date to compare with" in out
+
+
+def test_a_tagged_target_with_no_mapping_fp_fails(c: Canary) -> None:
+    write_mapping(c, fp="")
+    all_present(c)
+    code, out, _ = check(c)
+    assert code == 1
+    assert "mail-key  the mapping file records no fingerprint to compare with the tag" in out
+
+
+@pytest.mark.parametrize(("updated", "ok"), [("2026-10-31T23:30:00Z", True), ("2026-10-30", False)])
+def test_the_github_date_allows_one_day_for_time_zones(c: Canary, updated: str, ok: bool) -> None:
+    write_mapping(c, body=GH_ONLY)
+    c.target_put("gh:owner/app:MAIL_KEY", CANARY, updated_at=updated)
+    code, out, _ = check(c)
+    assert (code == 0) is ok, out
+
+
+def test_a_disabled_or_expired_key_vault_secret_is_not_present(c: Canary) -> None:
+    body = (
+        '[[credential.target]]\ntype = "azure-key-vault"\nvault = "app-kv"\nsecret = "mail-key"\n'
+    )
+    write_mapping(c, body=body)
+    c.target_put("az:app-kv:mail-key", CANARY, tags={"keys-fp": FP}, enabled=False)
+    code, out, _ = check(c)
+    assert code == 1
+    assert "mail-key  disabled at the target" in out
+    c.target_put(
+        "az:app-kv:mail-key", CANARY, tags={"keys-fp": FP}, expires="2026-11-01T00:00:00+00:00"
+    )
+    code, out, _ = check(c)
+    assert code == 1
+    assert "mail-key  expired at the target" in out
+
+
+def test_a_managed_key_vault_secret_is_not_unmapped(c: Canary) -> None:
+    body = (
+        '[[credential.target]]\ntype = "azure-key-vault"\nvault = "app-kv"\nsecret = "mail-key"\n'
+    )
+    write_mapping(c, body=body)
+    c.target_put("az:app-kv:mail-key", CANARY, tags={"keys-fp": FP})
+    c.target_put("az:app-kv:tls-cert", OTHER, managed=True)
+    code, out, _ = check(c)
+    assert code == 0, out
+
+
+def test_a_credential_with_only_railway_is_named_in_ci(c: Canary) -> None:
+    body = (
+        '[[credential.target]]\ntype = "railway"\nproject = "proj"\nservice = "app"\n'
+        'environment = "production"\nvariable = "MAIL_API_KEY"\n'
+    )
+    write_mapping(c, body=body)
+    code, out, _ = check(c)
+    assert code == 0, out
+    assert "app-mail  -  note: no target checked without --deep" in out
+    assert "1 targets (1 skipped)" not in out
+    assert "1 target (1 skipped)" in out
+
+
+def test_all_with_expect_is_a_usage_error(c: Canary) -> None:
+    write_mapping(c)
+    result = c.run(["check", "--all", "--expect", "works"], env=ENV)
+    assert result.code == 3
+    assert not c.children()
+
+
+def test_all_never_starts_op_even_with_an_op_fingerprint_key(c: Canary) -> None:
+    write_mapping(c)
+    all_present(c)
+    result = c.run(
+        ["check", "--all"],
+        env={"KEYS_FP_KEY": "op://Automation/fp/credential"},
+        today=lambda: TODAY,
+    )
+    assert result.code == 0, result.stdout
+    assert ops(c) == []
+
+
+def test_an_empty_mapping_fails_all(c: Canary) -> None:
+    (c.work / "keys.toml").write_text("")
+    code, out, _ = check(c)
+    assert code == 1
+    assert "keys check --all: 0 credentials, 0 targets, 1 problem" in out
+
+
+@pytest.mark.parametrize(
+    ("words", "shown"),
+    [
+        (["az", "keyvault", "secret", "list"], "cannot list: az exited 4 listing secrets"),
+        (["gcloud", "secrets", "list"], "cannot list: gcloud exited 4 listing secrets"),
+    ],
+)
+def test_a_vault_or_project_that_cannot_be_listed_fails(
+    c: Canary, words: list[str], shown: str
+) -> None:
+    write_mapping(c)
+    all_present(c)
+    c.child_fails(words, code=4)
+    code, out, _ = check(c)
+    assert code == 1
+    assert shown in out
+
+
+def test_a_listing_keys_cannot_read_fails_and_shows_none_of_it(c: Canary) -> None:
+    write_mapping(c)
+    all_present(c)
+    c.child_prints(["gh", "secret", "list"], f"not json {CANARY}")
+    code, out, _ = check(c)
+    assert code == 1
+    assert "cannot list: gh printed something keys cannot read" in out
+
+
+def test_deep_another_railway_value_never_shows(c: Canary) -> None:
+    write_mapping(c)
+    all_present(c)
+    c.target_put("railway:proj:app:production:OTHER_KEY", OTHER)
+    c.op_items([tagged("generic app-mail", "2026-11-01T00:00:00Z")])
+    code, out, _ = check(c, "--deep")
+    assert code == 0, out
+    assert "OTHER_KEY" not in out  # Railway variables are not checked for unmapped names
+
+
+@pytest.mark.parametrize("how", ["fails", "unreadable"])
+def test_deep_a_railway_listing_that_fails_is_a_problem(c: Canary, how: str) -> None:
+    write_mapping(c)
+    all_present(c)
+    c.op_items([tagged("generic app-mail", "2026-11-01T00:00:00Z")])
+    if how == "fails":
+        c.child_fails(["railway", "variable", "list"], code=5)
+        shown = "cannot list: railway exited 5 listing variables"
+    else:
+        c.child_prints(["railway", "variable", "list"], "{" + CANARY)
+        shown = "cannot list: railway printed something keys cannot read"
+    code, out, _ = check(c, "--deep")
+    assert code == 1
+    assert shown in out
+
+
+def test_deep_an_item_list_that_fails_is_a_problem(c: Canary) -> None:
+    write_mapping(c)
+    all_present(c)
+    c.op_list_fails(code=7)
+    code, out, _ = check(c, "--deep")
+    assert code == 1
+    assert "cannot list the items tagged keys: op exited 7 listing items" in out
+
+
+def test_deep_a_mapped_item_not_tagged_keys_fails(c: Canary) -> None:
+    write_mapping(c)
+    all_present(c)
+    c.op_items([])
+    code, out, _ = check(c, "--deep")
+    assert code == 1
+    assert "app-mail  1Password  the item is not tagged keys" in out
+
+
+def test_deep_railway_falls_back_to_the_mapping_fp_when_1password_fails(c: Canary) -> None:
+    write_mapping(c)
+    all_present(c, railway_value=OTHER)
+    c.op_fail(f"{ITEM}/credential", code=6)
+    c.op_items([tagged("generic app-mail", "2026-11-01T00:00:00Z")])
+    code, out, _ = check(c, "--deep")
+    assert code == 1
+    assert "MAIL_API_KEY  value differs from the mapping file (fp:" in out
+
+
 # ---------------------------------------------------------------------------- the daily scan
 
+PLIST = Path(__file__).parent.parent / "launchd" / "com.kilotronic.keys-scan.plist"
 
-def test_the_launchd_plist_runs_keys_scan_daily() -> None:
-    path = Path(__file__).parent.parent / "launchd" / "com.kilotronic.keys-scan.plist"
-    plist = plistlib.loads(path.read_bytes())
-    args = plist["ProgramArguments"]
-    assert "keys scan" in " ".join(args)
-    assert set(plist["StartCalendarInterval"]) <= {"Hour", "Minute", "Weekday"}
-    assert "Library/Logs/keys" in plist["StandardOutPath"]
+
+def test_the_launchd_plist_runs_keys_scan_daily_without_asking_for_touch_id() -> None:
+    plist = plistlib.loads(PLIST.read_bytes())
     assert plist["Label"] == "com.kilotronic.keys-scan"
+    args = plist["ProgramArguments"]
+    assert args[0].startswith("/Users/OWNER/")
+    assert args[0].endswith("/keys")
+    assert args[1:] == ["scan", "--patterns-only"]
+    assert set(plist["StartCalendarInterval"]) == {"Hour", "Minute"}
+    env = plist["EnvironmentVariables"]
+    assert env["KEYS_MAPPING"].startswith("/")
+    path = env["PATH"].split(":")
+    assert "/usr/bin" in path
+    assert all(p.startswith("/") for p in path)
+    for key in ("StandardOutPath", "StandardErrorPath"):
+        assert plist[key] == "/Users/OWNER/Library/Logs/keys/scan.log"
+
+
+def test_the_plist_holds_only_absolute_paths_launchd_can_use() -> None:
+    text = PLIST.read_text()
+    assert "~" not in text.replace("<!--", "").split("-->")[-1]
+    assert "$HOME" not in text
+    assert "${" not in text
+    plist = plistlib.loads(PLIST.read_bytes())
+    strings = [*plist["ProgramArguments"][:1], plist["StandardOutPath"]]
+    strings += list(plist["EnvironmentVariables"].values())
+    assert all(s.startswith("/") for s in strings)

@@ -91,7 +91,7 @@ def test_a_name_shaped_like_a_value(name: str) -> None:
     [
         f"{UUID}.jsonl",  # a Claude session transcript: named today, still named
         UUID,  # a file-history folder
-        "-Users-jason-Code-gh-keys-wt-looks2",  # a Claude project folder
+        "-Users-owner-Code-keys-wt-looks2",  # a Claude project folder
         "-private-tmp-claude-501-Users-owner-Code-app",
         "agent-a1b2c3d4e5f6a7b8c.jsonl",
         "snapshot-zsh-1732212345-abc123.sh",

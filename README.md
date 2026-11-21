@@ -126,21 +126,32 @@ target:
 
 - GitHub (repo, environment, organisation): the secret is there by name, and its update date is
   not before the credential's `rotated` date (GitHub cannot be read back, so the date stands
-  for the value);
-- Key Vault and Secret Manager: the secret is there, and the `keys-fp` tag or label `keys sync`
-  wrote equals the mapping file's `fp`;
+  for the value). GitHub's date is UTC and `rotated` is the owner's own day, so one day of slack
+  is allowed: a sync just after midnight east of UTC never fails, and a secret synced up to a
+  day before the rotation passes. A secret with no update date, or a credential with no
+  `rotated`, is a problem;
+- Key Vault and Secret Manager: the secret is there (in Key Vault, enabled and not expired), and
+  the `keys-fp` tag or label `keys sync` wrote equals the mapping file's `fp`; a credential with
+  no `fp` is a problem, since nothing could be compared. Whether a Secret Manager secret has an
+  enabled version is not checked (its listing does not say);
 - Railway: skipped, since any listing of its variables holds their values (checked with
   `--deep`);
 - any secret at a mapped repo, environment, organisation, vault or project that no mapping row
   names. A name that is not a credential (a CI setting held as a secret) goes in the mapping
-  file's `ignore_unmapped = ["NAME", ...]`. Railway variables are not checked for this: most are
-  settings, not secrets.
+  file's `ignore_unmapped = ["NAME", ...]`, which applies at every scope. Railway variables are
+  not checked for this (most are settings, not secrets), nor are Key Vault secrets that back a
+  certificate. GitHub and Key Vault names compare without regard to case, as those stores do.
+
+A credential whose targets are all Railway is named with a note, since `--all` checks none of
+them; the summary counts the skipped targets.
 
 `--deep` is for the Mac. It needs the fingerprint key, reads each value from 1Password in process
 and compares its keyed fingerprint with the mapping file's, reads each Railway variable in process
 and compares it with 1Password's, compares every tag and label with the real value, and lists
 every 1Password item tagged `keys` (names and dates only): each must be in the mapping file and
-updated within 180 days, which catches an item rotated by hand.
+updated within 180 days, which catches an item rotated by hand, and each mapped item must carry
+the tag. When a value cannot be read from 1Password, Railway's is compared with the mapping
+file's `fp` instead.
 
 ```text
 $ keys check --all --mapping keys/mapping.toml
@@ -154,7 +165,7 @@ app-mail  github-actions-env owner/app env:production MAIL_KEY  updated 2026-10-
 app-mail  azure-key-vault app-kv mail-key  present, fingerprint tag matches
 app-mail  railway app/production MAIL_API_KEY  skipped: Railway is checked with --deep
 -  github-actions owner/app  STRAY_TOKEN: not in the mapping file
-keys check --all: 1 credential, 4 targets, 2 problems
+keys check --all: 1 credential, 4 targets (1 skipped), 2 problems
 ```
 
 Exit 0 when clean, 1 on any problem, 3 for a usage error. A scope keys cannot list (no sign-in,
@@ -311,26 +322,32 @@ advice. What else differs:
 
 ## The daily scan
 
-`launchd/com.kilotronic.keys-scan.plist` runs `keys scan` every day at 09:15 through a login
-`zsh`, so `keys` and `op` are found on the owner's own `PATH`. Its log,
-`~/Library/Logs/keys/scan.log`, holds only what the scan prints: file names, line numbers,
-credential names and counts. To install it (by hand; nothing in keys installs it):
+`launchd/com.kilotronic.keys-scan.plist` runs `keys scan --patterns-only` every day at 09:15.
+launchd reads no shell profile and expands no variables, so the plist names `keys` by its full
+path and sets `PATH` and `KEYS_MAPPING` itself; `OWNER` and `MAPPING` are placeholders. Its log,
+`~/Library/Logs/keys/scan.log`, holds only what the scan prints: file names, line numbers, rule
+or credential names and counts. To install it (by hand; nothing in keys installs it), with the
+mapping file's path relative to your home folder:
 
 ```sh
-mkdir -p ~/Library/Logs/keys ~/Library/LaunchAgents
-cp launchd/com.kilotronic.keys-scan.plist ~/Library/LaunchAgents/
-# edit the two marked lines: the mapping file's path, and OWNER in the log path
+mkdir -p ~/Library/Logs/keys ~/Library/LaunchAgents && chmod 700 ~/Library/Logs/keys
+sed -e "s|/Users/OWNER|$HOME|g" -e "s|$HOME/MAPPING|$HOME/path/to/keys.toml|" \
+  launchd/com.kilotronic.keys-scan.plist > ~/Library/LaunchAgents/com.kilotronic.keys-scan.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.kilotronic.keys-scan.plist
 launchctl kickstart gui/$(id -u)/com.kilotronic.keys-scan   # one run now, to see it work
 ```
 
-To remove it: `launchctl bootout gui/$(id -u)/com.kilotronic.keys-scan`, then delete the file
-from `~/Library/LaunchAgents`.
+The plist expects `keys` in `~/.local/bin` (where `uv tool install` puts it); change the first
+`ProgramArguments` string if it is elsewhere. To remove it:
+`launchctl bootout gui/$(id -u)/com.kilotronic.keys-scan`, then delete the file from
+`~/Library/LaunchAgents`.
 
-The known-value pass reads every credential from 1Password, so a scheduled run asks for Touch ID
-when the Mac is unlocked and fails to read the values when nobody answers (the scan then exits 2
-and says which values it could not search for). For a run that never asks, add `--patterns-only`
-to the command in the plist: shapes only, no 1Password.
+By default the scheduled scan looks for secret shapes only, so it never asks for Touch ID with
+nobody there. The known-value pass, which reads every credential from 1Password, is opt-in:
+delete the `--patterns-only` line, and 1Password asks for Touch ID at 09:15 (with no answer, the
+scan exits 2 and names the values it could not search for). If the Mac is asleep at 09:15,
+launchd runs the scan when it wakes (missed days count as one run); if it is off, that day's run
+is skipped.
 
 ## Does this text look like a value?
 

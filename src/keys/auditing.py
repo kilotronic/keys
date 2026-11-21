@@ -30,6 +30,10 @@ from keys.op import Op, OpError
 from keys.secret import Secret
 
 WITHHELD = "<name withheld>"
+# GitHub's update time is UTC and the rotation date the owner's own: a sync just after midnight
+# east of UTC is dated the day before. One day of slack never fails a fresh sync; it lets a
+# secret synced up to a day before the rotation pass.
+SLACK = datetime.timedelta(days=1)
 Listing = dict[str, targets.Present] | targets.TargetError
 
 
@@ -64,8 +68,15 @@ class _Report:
         self.ok(who, where, verdict)
 
 
+def _key(a: targets.Adapter, name: str) -> str:
+    """How the store compares names: GitHub and Key Vault ignore case (gh lists upper case)."""
+    return name if isinstance(a, targets.Railway | targets.GcpSecret) else name.casefold()
+
+
 def run(args: argparse.Namespace, ctx: Context) -> int:
     deep: bool = args.deep
+    if args.expect:
+        raise UsageError("keys check --all takes no --expect")
     hidden = fp_key_variable(args.fp_key, ctx)
     environ = {k: v for k, v in ctx.environ.items() if k != hidden}
     fp_key = read_fp_key(args.fp_key, ctx) if deep else None  # --all never needs one
@@ -73,27 +84,28 @@ def run(args: argparse.Namespace, ctx: Context) -> int:
     plan = [(c, targets.adapters(c, environ)) for c in m.credentials]  # fields checked first
     today = ctx.today()
 
-    list_code = listing.run(args, ctx)
     report = _Report(ctx)
-    report.problems += sum(1 for c in m.credentials if listing.assess(c, today).problems)
-    over = m.kept_budget is not None and len(m.credentials) > m.kept_budget
-    report.problems += int(over) + int(not m.credentials)
+    report.problems += listing.report(m, ctx)
     ctx.say("")
 
     op = Op(environ)
     cache: dict[tuple[str, ...], Listing] = {}
     mapped: dict[tuple[str, ...], set[str]] = {}
     scopes: dict[tuple[str, ...], targets.Adapter] = {}
+    skipped = 0
     for c, ads in plan:
         real = _deep_value(c, op, fp_key, report) if fp_key is not None else None
+        checked = 0
         for a in ads:
-            mapped.setdefault(a.scope(), set()).add(a.name)
+            mapped.setdefault(a.scope(), set()).add(_key(a, a.name))
             if isinstance(a, targets.Railway):
                 if fp_key is None:
+                    skipped += 1
                     ctx.say(f"{c.name}  {a.describe()}  skipped: Railway is checked with --deep")
                 else:
                     _railway(c, a, fp_key, real, report)
                 continue
+            checked += 1
             scopes.setdefault(a.scope(), a)
             if a.scope() not in cache:
                 try:
@@ -104,20 +116,28 @@ def run(args: argparse.Namespace, ctx: Context) -> int:
             if isinstance(found, targets.TargetError):
                 report.bad(c.name, a.describe(), f"cannot list: {found}")
                 continue
-            present = found.get(a.name)
+            present = {_key(a, n): p for n, p in found.items()}.get(_key(a, a.name))
             if present is None:
                 report.bad(c.name, a.describe(), "not there")
+            elif not present.enabled:
+                report.bad(c.name, a.describe(), "disabled at the target")
+            elif _expired(present.expires):
+                report.bad(c.name, a.describe(), "expired at the target")
             elif isinstance(a, targets.AzureKeyVault | targets.GcpSecret):
                 _tagged(c, a, present, real, report)
             else:
                 _updated(c, a, present, report)
+        if ads and not checked and fp_key is None:
+            ctx.say(f"{c.name}  -  note: no target checked without --deep")
 
+    ignored = {n.casefold() for n in m.ignore_unmapped} | set(m.ignore_unmapped)
     for scope, a in scopes.items():
         found = cache.get(scope)
         if not isinstance(found, dict):
             continue
         for name in sorted(found):
-            if name not in mapped.get(scope, set()) and name not in m.ignore_unmapped:
+            known = _key(a, name) in mapped.get(scope, set()) or _key(a, name) in ignored
+            if not known and not found[name].managed:
                 report.bad("-", _scope_text(a), f"{_shown(name)}: not in the mapping file")
 
     if fp_key is not None:
@@ -131,8 +151,24 @@ def run(args: argparse.Namespace, ctx: Context) -> int:
         else f"{report.problems} problem" + ("" if report.problems == 1 else "s")
     )
     noun = "credential" if n == 1 else "credentials"
-    ctx.say(f"keys check --{'deep' if deep else 'all'}: {n} {noun}, {t} targets, {found_text}")
-    return EXIT_FAIL if report.problems or list_code != EXIT_OK else EXIT_OK
+    tnoun = "target" if t == 1 else "targets"
+    skip = f" ({skipped} skipped)" if skipped else ""
+    ctx.say(
+        f"keys check --{'deep' if deep else 'all'}: {n} {noun}, {t} {tnoun}{skip}, {found_text}"
+    )
+    return EXIT_FAIL if report.problems else EXIT_OK
+
+
+def _expired(text: str) -> bool:
+    if not text:
+        return False
+    try:
+        when = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return False
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.UTC)
+    return when <= datetime.datetime.now(datetime.UTC)
 
 
 def _deep_value(c: mapping.Credential, op: Op, fp_key: Secret, report: _Report) -> str | None:
@@ -163,7 +199,11 @@ def _updated(
 ) -> None:
     """A GitHub secret cannot be read back, so its update date stands for the value."""
     updated = _date(present.updated_at)
-    if c.rotated and updated and updated < c.rotated:
+    if updated is None:
+        report.bad(c.name, a.describe(), "present, but GitHub gives no update date to compare")
+    elif c.rotated is None:
+        report.bad(c.name, a.describe(), "present, but no rotation date to compare with")
+    elif updated < c.rotated - SLACK:
         report.bad(
             c.name,
             a.describe(),
@@ -196,7 +236,11 @@ def _tagged(
             f"fingerprint {word} fp:{present.fp}, the mapping file records fp:{c.fp}",
         )
     elif not c.fp and real is None:
-        report.ok(c.name, a.describe(), "present; no fingerprint in the mapping file to compare")
+        report.bad(
+            c.name,
+            a.describe(),
+            f"the mapping file records no fingerprint to compare with the {word}",
+        )
     else:
         report.ok(c.name, a.describe(), f"present, fingerprint {word} matches")
 
@@ -218,8 +262,13 @@ def _railway(
         return
     fp = fingerprint(fp_key, Secret(value.reveal().rstrip("\n")))
     del value
-    if real is None:
-        report.ok(c.name, a.describe(), f"present (fp:{fp}); 1Password's value not compared")
+    if real is None and c.fp:
+        if fp != c.fp:
+            report.bad(c.name, a.describe(), f"value differs from the mapping file (fp:{fp})")
+        else:
+            report.ok(c.name, a.describe(), "present, value matches the mapping file")
+    elif real is None:
+        report.bad(c.name, a.describe(), f"present (fp:{fp}); nothing to compare it with")
     elif fp != real:
         report.bad(c.name, a.describe(), f"value differs from 1Password (fp:{fp})")
     else:
@@ -235,6 +284,10 @@ def _items(m: mapping.Mapping, op: Op, today: datetime.date, report: _Report) ->
         report.bad("-", "1Password", f"cannot list the items tagged keys: {e}")
         return
     known = {(c.vault.casefold(), c.item_title.casefold()) for c in m.credentials}
+    tagged = {(i["vault"].casefold(), i["title"].casefold()) for i in items}
+    for c in m.credentials:
+        if (c.vault.casefold(), c.item_title.casefold()) not in tagged:
+            report.bad(c.name, "1Password", "the item is not tagged keys")
     for item in items:
         vault, title = item["vault"], item["title"]
         plain = not (looks.looks_like_value(vault) or looks.looks_like_value(title))
