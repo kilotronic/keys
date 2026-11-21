@@ -21,6 +21,21 @@ def _lower_escapes(text: str) -> str:
     return re.sub(r"%[0-9A-F]{2}", lambda m: m.group().lower(), text)
 
 
+def base64_forms(value: Secret) -> list[bytes]:
+    """The value's base64 at each alignment, standard and URL-safe, cut to the characters that
+    depend only on the value."""
+    raw = value.reveal().encode()
+    out: list[bytes] = []
+    for shift in range(3):
+        start = (shift * 8 + 5) // 6
+        for enc in (base64.b64encode, base64.urlsafe_b64encode):
+            text = enc(b"\0" * shift + raw).rstrip(b"=")
+            part = text[start : len(text) - 2]
+            if len(part) >= PIECE:
+                out.append(part)
+    return list(dict.fromkeys(out))
+
+
 def forms(value: Secret) -> list[bytes]:
     """Every form, longest first, without duplicates."""
     v = value.reveal()
@@ -37,6 +52,7 @@ def forms(value: Secret) -> list[bytes]:
         json.dumps(v, ensure_ascii=False)[1:-1].encode(),
         raw.hex().encode(),
         raw.hex().upper().encode(),
+        v.encode("utf-16-le"),  # Chromium and Electron storage
     ]
     for shift in range(3):
         start = (shift * 8 + 5) // 6

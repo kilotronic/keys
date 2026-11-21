@@ -82,6 +82,47 @@ github key fp:3f9a1c02 github_p…Ab3d: DEAD (HTTP 401 from api.github.com/rate_
 - Exit 0 for WORKS (or the `--expect` verdict), 1 for DEAD (or the other), 2 for UNKNOWN, 3 for
   a usage error.
 
+### `keys scan`
+
+Searches the places an agent's or a shell's words are kept, all of them backed up and outliving
+any key: `~/.claude` (transcripts, typed-prompt history, file history, shell snapshots, debug
+logs), Claude's temp and scratch folders (`claude*` under `$TMPDIR`, `/tmp`, `/private/tmp`),
+the Claude desktop app's logs and support folder, Cursor's agent folders, shell history, and
+saved Terminal, iTerm2 and tmux state. `keys scan --paths` lists them; `--path` adds one.
+
+Caches, disk images and editor extensions are skipped; `$HISTFILE` and `$ZDOTDIR` are
+followed, and so is a root that is a symlink (a dotfiles manager's `~/.claude`).
+
+Two passes over each file, read in overlapping 1 MB pieces. First every credential in the
+mapping file, read in memory from 1Password and searched for as sent and in its URL-encoded,
+JSON-escaped, base64 (also wrapped across lines), hex and UTF-16 forms, and with any backslash
+escaping removed (JSON inside JSON, shell history); that catches what no pattern can, such as a
+random signing secret. Then pattern rules for secret
+shapes (GitHub, Anthropic, OpenAI, Slack, AWS, Google, Stripe and 1Password service-account
+tokens, private keys). A finding names the file, the line and the credential or rule, never the
+text it matched, and a file name that itself holds a value or a shape is withheld:
+
+```text
+~/.claude/projects/<project>/<session>.jsonl:412: app-mail (known value)
+~/.zsh_history:9031: looks like github-token
+keys scan: 18234 files, 2 findings
+```
+
+Exit 1 on any finding, 2 when the scan is incomplete (a value 1Password could not give, or a
+file or folder it could not read), 0 when clean. It runs at about 9 MB/s with 30 credentials. `--patterns-only` skips 1Password.
+
+The response to a finding: rotate that key (backups already hold it), then scrub the file.
+
+### `keys scrub <file>`
+
+Replaces every match in one text file (each known value in each form, the whole base64 run
+around an encoded one, a whole private-key block, and each pattern match) with
+`[removed by keys scrub]`. It rewrites the same file in place, so a program still writing to it
+keeps one file, and refuses binary files (a database or saved state), which a rewrite would
+break: for those, rotate the key and delete the file if nothing needs it. It prints only how
+many it replaced. Nobody opens the file to redact it by hand, which would copy the value into a new
+transcript.
+
 ## The canary tests
 
 Every command's tests run through one harness, `tests/canary.py`. It plants a made-up value in
