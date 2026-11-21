@@ -58,7 +58,10 @@ PIECE = 9  # a run of this many of the value's characters is a leak (the hint sh
 ENCODED_PIECE = 12
 HERE = Path(__file__).parent
 FAKE_CHILD = HERE / "fake_child.py"
-FAKE_PROGRAMS = ("op", "gh", "railway", "az", "gcloud", "security", "pbcopy", "open")
+FAKE_PROGRAMS = ("op", "gh", "railway", "az", "gcloud", "security", "pbcopy", "open", "psql")
+# The one variable a child may receive a value in: psql reads a password nowhere else but a
+# prompt or a file (the design's "a program that needs it", in a child's environment).
+ENV_OK = {("psql", "PGPASSWORD")}
 # The only children that may be handed a value on stdin: 1Password's item writes and each
 # target's write command, matched on their leading words (so `az keyvault secret show` is not).
 STDIN_OK = (
@@ -222,6 +225,9 @@ class Canary:
         self.extra_values: list[str] = []
         # Values no target may ever receive (a minting key): a write of one fails the test.
         self.never_written: list[str] = []
+        # Values a target may receive that 1Password never held: what keys made itself for a
+        # secret kept only at its targets (the test makes keys's random values watched ones).
+        self.writable: list[str] = []
 
     # ------------------------------------------------------------------ setting the scene
 
@@ -626,7 +632,7 @@ class Canary:
         """Every value 1Password held during the run: the canary, op_values, the items' fields
         now, and every field an item write sent (a rotation moves values between fields)."""
         self._load_db()
-        held = [self.value, *self.db.get("values", {}).values()]
+        held = [self.value, *self.db.get("values", {}).values(), *self.writable]
         for item in self.db.get("items", []):
             held += [str(f.get("value") or "") for f in item.get("fields", [])]
         for c in children:
@@ -672,7 +678,9 @@ class Canary:
             if e["event"] == "spawn":
                 prog = self._program(e)
                 channels.append((f"argv of {prog}", "\0".join(e["argv"]).encode()))
-                env_text = "\0".join(f"{k}={v}" for k, v in e["env"].items())
+                env_text = "\0".join(
+                    f"{k}={v}" for k, v in e["env"].items() if (prog, k) not in ENV_OK
+                )
                 channels.append((f"environment of {prog}", env_text.encode()))
             elif e["event"] == "write":
                 self._check_write(Path(e["path"]))

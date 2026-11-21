@@ -33,12 +33,13 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
 
-from keys import appjwt, files, listing, looks, mapping, probes, proc, rotators, targets
+from keys import appjwt, files, listing, looks, mapping, probes, proc, rotators, runtime, targets
 from keys.checking import fp_key_variable, read_fp_key
 from keys.context import EXIT_FAIL, EXIT_OK, EXIT_WAITING, Context, UsageError
 from keys.fingerprint import fingerprint
 from keys.kinds import KINDS
 from keys.op import Op, OpError, fields, set_fields
+from keys.runtime import OVERLAP_DAYS
 from keys.secret import Secret
 
 STEP = "keys_step"  # where a rotation stands, kept in the item (not secret)
@@ -79,7 +80,12 @@ class StepError(Exception):
 
 
 def configure(p: argparse.ArgumentParser) -> None:
-    p.add_argument("name", help="the credential to rotate")
+    p.add_argument(
+        "names",
+        nargs="+",
+        metavar="name",
+        help="the credential to rotate (several, for secrets kept only at their targets)",
+    )
     p.add_argument(
         "--dry-run", action="store_true", help="check what can be checked and print the plan"
     )
@@ -87,6 +93,18 @@ def configure(p: argparse.ArgumentParser) -> None:
         "--now",
         action="store_true",
         help="rotate a kind that keeps one key at a time, which means a short outage",
+    )
+    overlap = p.add_mutually_exclusive_group()
+    overlap.add_argument(
+        "--keep-previous",
+        action="store_true",
+        help=f"a generated secret: the old value keeps working for {OVERLAP_DAYS} days in its "
+        "target's previous variable (a planned rotation only, never after a leak)",
+    )
+    overlap.add_argument(
+        "--end-overlap",
+        action="store_true",
+        help="a generated secret: delete the previous variable, and redeploy either way",
     )
     p.add_argument(
         "--fp-key",
@@ -105,7 +123,16 @@ def _find(m: mapping.Mapping, name: str, what: str) -> mapping.Credential:
 
 def run(args: argparse.Namespace, ctx: Context) -> int:
     m = listing.load(args, ctx)
-    c = _find(m, args.name, "the name given")
+    found = [_find(m, n, "the name given") for n in args.names]
+    if any(KINDS[f.kind].runtime for f in found):
+        if not all(KINDS[f.kind].runtime for f in found):
+            raise UsageError("only secrets kept at their targets alone rotate together")
+        return runtime.run(args, ctx, found)
+    if len(found) > 1:
+        raise UsageError("rotate one credential at a time")
+    if args.keep_previous or args.end_overlap:
+        raise UsageError("--keep-previous and --end-overlap are for generated secrets")
+    c = found[0]
     rot = rotators.ROTATORS.get(c.kind)
     if rot is None:
         raise UsageError(f"keys cannot rotate a {c.kind} yet; it can rotate {_kinds()}")

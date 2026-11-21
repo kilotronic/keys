@@ -59,7 +59,12 @@ CREDENTIAL_FIELDS = {
     "target",
     "minted_by",
     "permissions",
+    "generate",
+    "redeploy",
+    "url_variable",
 }
+GENERATE = re.compile(r"^(hex|urlsafe)(16|24|32|48|64)$")  # the form and bytes of a new value
+SERVICE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$")
 # A GitHub token's permission levels, as its pre-filled creation page takes them.
 LEVELS = {"read", "write", "admin"}
 # Target type: (required fields, optional fields), besides `type` and `verify`.
@@ -94,6 +99,8 @@ class Target:
     # A non-secret field of the item this target receives instead of the key (a Twilio key's
     # SID next to its secret); empty for the key itself.
     field: str = ""
+    store: str = ""  # "sha256": the target holds the value's hex digest, not the value
+    previous: str = ""  # Railway: the variable that keeps the old value during an overlap
 
 
 @dataclass(frozen=True)
@@ -111,6 +118,11 @@ class Credential:
     targets: list[Target] = dataclasses.field(default_factory=lambda: list[Target]())
     minted_by: str = ""  # the credential (by name) whose key mints this one
     permissions: dict[str, str] = dataclasses.field(default_factory=lambda: dict[str, str]())
+    # Runtime kinds (generated, postgres-password): how a new value is made, which Railway
+    # services are redeployed in which order, and the variable holding a database's URL.
+    generate: str = ""
+    redeploy: list[str] = dataclasses.field(default_factory=lambda: list[str]())
+    url_variable: str = ""
 
     @property
     def item(self) -> str:
@@ -171,7 +183,7 @@ def _target(where: str, raw: object, problems: list[str]) -> Target | None:
         problems.append(f"{where}.type: must be one of {', '.join(TARGETS)}")
         return None
     required, optional = TARGETS[kind]
-    allowed = {"type", "verify", "field", *required, *optional}
+    allowed = {"type", "verify", "field", "store", "previous", *required, *optional}
     fields: dict[str, str | list[str]] = {}
     for key in t:
         if key not in allowed:
@@ -213,7 +225,19 @@ def _target(where: str, raw: object, problems: list[str]) -> Target | None:
             delivered = ""
         elif kind not in FIELD_TARGETS:
             problems.append(f"{where}.field: only {', '.join(FIELD_TARGETS)} targets take one")
-    return Target(kind, fields, verify, delivered)
+    store = ""
+    if "store" in t:
+        store = t["store"] if t["store"] == "sha256" else ""
+        if not store:
+            problems.append(f'{where}.store: only "sha256" (the value\'s digest)')
+    previous = ""
+    if "previous" in t:
+        previous = t["previous"] if isinstance(t["previous"], str) else ""
+        if kind != "railway":
+            problems.append(f"{where}.previous: only Railway targets keep an old value")
+        elif not SECRET_NAME.fullmatch(previous) or looks.looks_like_value(previous):
+            problems.append(f"{where}.previous: must be a variable name")
+    return Target(kind, fields, verify, delivered, store, previous)
 
 
 def _credential(
@@ -257,7 +281,11 @@ def _credential(
 
     vault = title = ""
     item = c.get("item")
-    if item is None:
+    runtime = isinstance(kind, str) and kind in KINDS and KINDS[kind].runtime
+    if runtime:
+        if item is not None:
+            problems.append(f"{where}.item: a {kind} lives only at its targets, with no item")
+    elif item is None:
         problems.append(f"{where}.item: missing")
     else:
         m = ITEM.fullmatch(item) if isinstance(item, str) else None
@@ -299,6 +327,29 @@ def _credential(
                 else:
                     permissions[k] = cast(str, v)
     expires = _date(f"{where}.expires", c["expires"], problems) if "expires" in c else None
+    generate = c.get("generate", "")
+    if not isinstance(generate, str) or (generate and not GENERATE.fullmatch(generate)):
+        problems.append(f"{where}.generate: hex or urlsafe, then the bytes, like hex32")
+        generate = ""
+    redeploy: list[str] = []
+    if "redeploy" in c:
+        raw = c["redeploy"]
+        items = cast(list[object], raw) if isinstance(raw, list) else None
+        if items is None or not all(isinstance(r, str) and SERVICE.fullmatch(r) for r in items):
+            problems.append(f"{where}.redeploy: a list of Railway service names")
+        else:
+            redeploy = [cast(str, r) for r in items]
+    url_variable = c.get("url_variable", "")
+    if not isinstance(url_variable, str) or (
+        url_variable and not SECRET_NAME.fullmatch(url_variable)
+    ):
+        problems.append(f"{where}.url_variable: must be a variable name")
+        url_variable = ""
+    for key in ("generate", "redeploy", "url_variable"):
+        if key in c and not runtime:
+            problems.append(f"{where}.{key}: only for generated and postgres-password")
+    if kind == "postgres-password" and not url_variable:
+        problems.append(f"{where}.url_variable: missing (the variable holding the database URL)")
 
     targets: list[Target] = []
     raw_targets: object = c.get("target", [])
@@ -330,6 +381,9 @@ def _credential(
         targets=targets,
         minted_by=minted_by,
         permissions=permissions,
+        generate=generate,
+        redeploy=redeploy,
+        url_variable=url_variable,
     )
 
 

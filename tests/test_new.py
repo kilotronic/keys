@@ -27,7 +27,7 @@ def mapping(c: Canary) -> dict[str, Any]:
     return tomllib.loads((c.work / "keys.toml").read_text())
 
 
-@pytest.mark.parametrize("kind", sorted(KINDS))
+@pytest.mark.parametrize("kind", sorted(k for k in KINDS if not KINDS[k].runtime))
 def test_each_kind_makes_its_item_and_entry(canary: Canary, kind: str) -> None:
     result = canary.run(["new", kind, "app-thing", *ARGS])
     assert result.code == 0, result.stderr

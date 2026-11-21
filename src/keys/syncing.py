@@ -19,6 +19,7 @@ from keys import listing, mapping, targets
 from keys.checking import fp_key_variable, read_fp_key
 from keys.context import EXIT_FAIL, EXIT_OK, Context, UsageError
 from keys.fingerprint import fingerprint
+from keys.kinds import KINDS
 from keys.op import Op, OpError
 from keys.secret import Secret
 
@@ -47,12 +48,17 @@ def chosen(args: argparse.Namespace, m: mapping.Mapping) -> list[mapping.Credent
     name: str | None = args.name
     if bool(name) == bool(args.all):
         raise UsageError("give a credential's name or --all")
-    if args.all:
-        return m.credentials
+    if args.all:  # a secret kept only at its targets has no 1Password value to sync
+        return [c for c in m.credentials if not KINDS[c.kind].runtime]
     found = [c for c in m.credentials if c.name == name]
     if not found:
         # Not echoed: a value typed in place of the name would be printed back.
         raise UsageError("no credential by that name in the mapping file")
+    if KINDS[found[0].kind].runtime:
+        raise UsageError(
+            f"{found[0].name}: a {found[0].kind} lives only at its targets; keys rotate makes "
+            "a new one there"
+        )
     return found
 
 

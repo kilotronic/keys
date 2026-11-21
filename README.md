@@ -419,6 +419,49 @@ keys rotate: deploy rotated; commit the mapping file
 - Exit 0 when rotated, 1 when a step failed (the line names it), 3 for a usage error, 5 when it
   waits for the owner (a paste or a click).
 
+### Secrets kept only at their targets: `generated` and `postgres-password`
+
+A secret the app owns (a signing key, a job's key, a datastore password) has no 1Password
+item: it lives only at its targets, and `keys rotate` makes the new value itself. The mapping
+entry has no `item`; `generate` says the form (`hex32`, the default, or `urlsafe32`, `hex24`
+and so on), `redeploy` the order Railway services restart in, and each target may say
+`store = "sha256"` (it holds the value's digest) or, on Railway, `previous = "<variable>"`
+(where the old value waits during an overlap).
+
+```toml
+[[credential]]
+name = "jwt-secret"
+kind = "generated"
+kept_because = "the app signs its sessions with it"
+
+[[credential.target]]
+type = "railway"
+service = "app"
+environment = "production"
+variable = "JWT_SECRET"
+previous = "JWT_SECRET_FALLBACK"
+```
+
+- `keys rotate a b ...` rotates several together: each value is staged without a deploy, each
+  Railway service is redeployed once (in `redeploy` order, then the rest), each Railway
+  variable is read back and compared by fingerprint, then each GitHub target is set (after the
+  app, so a failure strands a job, never a sign-in). Then `fp` and `rotated` are recorded.
+- `--keep-previous` (a planned rotation, never after a leak) stages the current value in the
+  `previous` variable before the new one, so tokens the old value signed keep working; it
+  refuses while an overlap runs. After 30 days, `keys rotate <name> --end-overlap` deletes the
+  `previous` variable and redeploys (either way, so a rerun finishes a redeploy that failed).
+  A plain rotation deletes any `previous` value, ending the overlap at once.
+- `postgres-password` first changes the database's password over the old URL (the variable
+  `url_variable` names), sending a SCRAM verifier so the server never sees the password, then
+  stages it, and the new URL must connect before anything restarts. psql gets the password in
+  `PGPASSWORD` and its `\set` lines on stdin, never on its command line. If anything fails
+  from the change on, keys says how to set the database back to what Railway holds.
+- A failure names what may be staged: rerun (fresh values) after a plain rotation; after
+  `--keep-previous`, redeploy by hand and end the overlap later.
+- `keys sync`, `keys fp` and the 1Password pass of `keys scan` skip these (there is no item);
+  `keys check --deep` compares Railway with the mapping file's `fp`, and a digest target only
+  for being there.
+
 ## Shim for check_key.py
 
 The old key checker, `check_key.py`, becomes a thin shim that runs `keys`. Its
@@ -555,12 +598,9 @@ Agents sign in to GitHub as an App instead of the owner's own login (design: the
 
 Phase 2, from the design:
 
-- `keys rotate` for the Railway signing-secret and datastore rotation of the script it
-  replaces.
 - An issue from day 120 in the nightly check (the workflow lives in the mapping repo).
 - The gitleaks pass in `keys scan`, with the shared secret-scan rules and `--redact`, and a
   scan of only the files changed since the last run, for speed.
-- The design's other starting kinds: `openai-key`, `azure-app-secret`, and `generated` (a
-  random signing secret, with `mint`).
+- The design's other starting kinds: `openai-key` and `azure-app-secret`.
 - A check, once, that `op item create` keeps the empty non-secret fields `keys new` asks for
   (`op item create --dry-run` previews without saving).

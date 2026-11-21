@@ -81,6 +81,11 @@ def run(args: argparse.Namespace, ctx: Context) -> int:
     vault: str = args.vault
     reason: str = args.kept_because
     owner: str | None = args.owner
+    if KINDS[kind].runtime:
+        raise UsageError(
+            f"a {kind} lives only at its targets, with no 1Password item: add its mapping entry "
+            "by hand (see the README), then keys rotate makes its value"
+        )
     _refuse_value("the name", name)
     if looks.name_looks_like_value(name):
         raise UsageError("the name looks like a value; give it a short descriptive name")

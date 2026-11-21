@@ -57,6 +57,8 @@ def fp(args: argparse.Namespace, ctx: Context) -> int:
         # Not repeated: a value typed in place of a name would be printed back.
         raise UsageError("no credential by that name in the mapping file")
     c = found[0]
+    if KINDS[c.kind].runtime:
+        raise UsageError(f"{c.name}: a {c.kind} has no 1Password value; keys check --deep reads it")
     fp_key = checking.read_fp_key(args.fp_key, ctx)
     try:
         value = Op(ctx.environ).read(c.value_ref)

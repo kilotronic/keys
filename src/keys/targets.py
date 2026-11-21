@@ -283,6 +283,14 @@ class Railway(Adapter):
         del rows
         return {n: Present(n) for n in names}
 
+    def delete(self) -> None:
+        """Remove this variable. Railway has no --skip-deploys for a delete, so it may deploy;
+        a redeploy after it waits for that to settle."""
+        self._run(
+            "deleting the variable",
+            ["railway", "variable", "delete", self.name, *self._scope_flags()],
+        )
+
     def read(self) -> Secret | None:
         """This variable's value, read in process (keys check --deep); None when it is not set.
         The other variables' values in the same listing are dropped at once."""

@@ -26,6 +26,7 @@ from keys import listing, looks, mapping, targets
 from keys.checking import fp_key_variable, read_fp_key
 from keys.context import EXIT_FAIL, EXIT_OK, Context, UsageError
 from keys.fingerprint import fingerprint
+from keys.kinds import KINDS
 from keys.op import Op, OpError
 from keys.secret import Secret
 
@@ -94,7 +95,8 @@ def run(args: argparse.Namespace, ctx: Context) -> int:
     scopes: dict[tuple[str, ...], targets.Adapter] = {}
     skipped = 0
     for c, ads in plan:
-        real = _deep_value(c, op, fp_key, report) if fp_key is not None else None
+        runtime = KINDS[c.kind].runtime  # no item: the targets are compared with the mapping
+        real = _deep_value(c, op, fp_key, report) if fp_key is not None and not runtime else None
         checked = 0
         for a in ads:
             mapped.setdefault(a.scope(), set()).add(_key(a, a.name))
@@ -274,6 +276,10 @@ def _railway(
         return
     if value is None:
         report.bad(c.name, a.describe(), "not there")
+        return
+    if a.target.store:  # a digest of the value: nothing here to compare it with
+        del value
+        report.ok(c.name, a.describe(), "present (it holds a digest)")
         return
     fp = fingerprint(fp_key, Secret(value.reveal().rstrip("\n")))
     del value

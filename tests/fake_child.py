@@ -271,6 +271,57 @@ def target_key(prog: str, flags: dict[str, str | bool], name: str) -> str:
     return f"gcp:{_flag(flags, '--project')}:{name}"
 
 
+def _scram_check(password: str, verifier: str) -> bool:
+    """Whether password is the one behind a SCRAM-SHA-256 verifier, as Postgres checks it."""
+    import base64
+    import hashlib
+    import hmac
+
+    try:
+        head, keys = verifier.split("$", 2)[1:]
+        iterations, salt = head.split(":")
+        stored = keys.split(":")[0]
+        salted = hashlib.pbkdf2_hmac(
+            "sha256", password.encode(), base64.b64decode(salt), int(iterations)
+        )
+        client = hmac.new(salted, b"Client Key", "sha256").digest()
+        return base64.b64encode(hashlib.sha256(client).digest()).decode() == stored
+    except ValueError:
+        return False
+
+
+def _psql(words: list[str], stdin: str, db: dict[str, Any]) -> int:
+    """A Postgres that knows one password (`pg_password`, or after an ALTER its verifier). The
+    URL must hold no password: it comes in PGPASSWORD. `\\set name 'value'` lines are read."""
+    from urllib.parse import urlsplit
+
+    url = urlsplit(words[0]) if words else None
+    if url is None or url.password is not None:
+        print("fake psql: a password on the command line", file=sys.stderr)
+        return 2
+    given = os.environ.get("PGPASSWORD", "")
+    pg = db.setdefault("pg", {})
+    known = pg.get("verifier")
+    ok = _scram_check(given, known) if known else given == pg.get("password")
+    if not ok:
+        print("psql: FATAL: password authentication failed", file=sys.stderr)
+        return 2
+    sets: dict[str, str] = {}
+    for line in stdin.splitlines():
+        if line.startswith("\\set "):
+            _, name, value = line.split(" ", 2)
+            sets[name] = value.strip("'")
+        elif line.startswith("ALTER USER"):
+            if pg.get("alter_fails"):
+                return 3
+            pg["verifier"] = sets["verifier"]
+            pg["altered_by"] = url.username or ""
+        elif line.strip() == "select 1;":
+            print("1")
+    _save(db)
+    return 0
+
+
 def _labels(text: str) -> dict[str, str]:
     return dict(p.split("=", 1) for p in text.split(",") if "=" in p)
 
@@ -341,8 +392,20 @@ def targets(
         print(json.dumps(rows))
         return 0
     if w[:3] == ["railway", "variable", "set"] and len(w) == 4 and "--stdin" in flags:
-        _put(db, target_key("railway", flags, w[3]), stdin, skip_deploys="--skip-deploys" in flags)
+        key = target_key("railway", flags, w[3])
+        _put(db, key, stdin, skip_deploys="--skip-deploys" in flags)
+        derived = db.get("derived", {}).get(key)  # Railway rebuilds a URL from a password
+        if derived:
+            from urllib.parse import quote
+
+            url = derived["template"].format(pw=quote(stdin, safe=""))
+            db["targets"][derived["url"]]["value"] = url
         return 0
+    if w[:3] == ["railway", "variable", "delete"] and len(w) == 4:
+        db.get("targets", {}).pop(target_key("railway", flags, w[3]), None)
+        return 0
+    if prog == "psql":
+        return _psql(words, stdin, db)
     if w[:3] == ["railway", "variable", "list"] and "--json" in flags:
         prefix = target_key("railway", flags, "")
         print(json.dumps({n: v["value"] for n, v in _under(db, prefix).items()}))
