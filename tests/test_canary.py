@@ -384,3 +384,12 @@ def test_the_harness_runs_in_its_own_home(canary: Canary) -> None:
         return 0
 
     canary.call(step)
+
+
+def test_a_file_named_after_the_value_is_caught(canary: Canary) -> None:
+    def step(ctx: Context) -> int:
+        (canary.work / canary.value.replace("/", "_")[:20]).write_text("clean")
+        return 0
+
+    with pytest.raises(LeakError, match="file name"):
+        canary.call(step)

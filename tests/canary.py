@@ -242,8 +242,14 @@ class Canary:
         self.db["items"] = items
         self._save_db()
 
-    def op_create_fails(self, code: int = 1) -> None:
-        self.db["create_fail"] = {"code": code, "stderr": f"[ERROR] {self.value}"}
+    def op_create_fails(self, code: int = 1, *, saved: bool = False) -> None:
+        """The fake `op item create` fails; with saved, the item is listed afterwards anyway,
+        as when op times out after the server saved it."""
+        self.db["create_fail"] = {"code": code, "stderr": f"[ERROR] {self.value}", "saved": saved}
+        self._save_db()
+
+    def op_list_fails(self, code: int = 1) -> None:
+        self.db["list_fail"] = {"code": code, "stderr": f"[ERROR] {self.value}"}
         self._save_db()
 
     def plant(self, rel: str | Path, text: str) -> Path:
@@ -463,6 +469,9 @@ class Canary:
                 if form:
                     raise LeakError(f"the planted value reached {name} ({form} form)")
             for path in self._files():
+                form = self._leak(value, os.fsencode(path.relative_to(self.root)))
+                if form and path not in self.planted:
+                    raise LeakError(f"the planted value reached a file name ({form} form)")
                 data = path.read_bytes()
                 if self.planted.get(path) == _digest(data):
                     continue

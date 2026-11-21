@@ -4,7 +4,8 @@ A small command-line tool for the owner's credentials that never prints, logs or
 credential's value. It reads values from 1Password in memory, passes them only on stdin or in a
 child's environment, and prints names, fingerprints, dates and verdicts.
 
-Phase 1 of the design: list, check, scan, scrub and new. See [What is next](#what-is-next).
+Phase 1 of the design: list, check, scan, scrub and new. `keys list` and the `generic` kind
+are additions to the design's lists. See [What is next](#what-is-next).
 
 ## The mapping file
 
@@ -128,8 +129,11 @@ transcript.
 Makes the empty 1Password item for a credential, and adds its mapping entry. The item is an API
 Credential titled `<kind> <name>`, tagged `keys` and the kind, with an empty concealed
 `credential` field and the kind's other fields (an App's id, a token's id or owner), also empty.
-It goes to `op` as JSON on stdin, never as `field=value` arguments. keys refuses a name already
-in the mapping file or an item title already in the vault.
+It goes to `op` as JSON on stdin, never as `field=value` arguments. keys refuses a name or item
+already in the mapping file, an item title already in the vault (in any case), and any flag
+text shaped like a key, before anything is made. It creates only `./keys.toml`, never a missing
+file named by `--mapping` or `$KEYS_MAPPING`. If `op` fails after saving the item, `--entry-only`
+adds just the mapping entry.
 
 ```text
 $ keys new cloudflare-token deploy --vault <vault> --kept-because "no OIDC sign-in for deploys"
@@ -176,5 +180,12 @@ Phase 2, from the design:
   not updated in 180 days; `keys fp <name>`.
 - The gitleaks pass in `keys scan`, with the shared secret-scan rules and `--redact`, and a
   scan of only the files changed since the last run, for speed.
+- `keys rotate --dry-run` and `--now`, and `keys sync --dry-run`.
+- The design's other starting kinds: `railway-workspace-token`, `openai-key`, `resend-key`,
+  `twilio-key`, `azure-app-secret`, and `generated` (a random signing secret, with `mint`).
 - Probes for Railway, Resend and Twilio, and the old checker's Key Vault and gitleaks-report
   sources, so the old scripts can become thin shims and then be deleted.
+- The schedules: the nightly CI run with an issue from day 120, and a daily launchd `keys scan`
+  on the Mac.
+- A check, once, that `op item create` keeps the empty non-secret fields `keys new` asks for
+  (`op item create --dry-run` previews without saving).
