@@ -14,7 +14,7 @@ keys = "keys.cli:entry"
 dev = ["pytest>=8", "ruff>=0.14", "pyright>=1.1.400"]
 
 [build-system]
-requires = ["hatchling>=1.27"]
+requires = ["hatchling>=1.33.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
