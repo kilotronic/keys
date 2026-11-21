@@ -38,7 +38,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: kilotronic/lint@57c42f430af9a89607e32d1947714e2e594db6f3 # v1.2.0
+      - uses: kilotronic/lint@b5343bfa69d890919c8774733da372d13d23d6d3 # v1.3.1
 
   # Real authors on this event's commits, in the owner's domains, from kilotronic/git-identity.
   git-identity:
@@ -56,7 +56,7 @@ jobs:
           allow-bots: dependabot
           commit-subject: true
 
-  # ruff, pyright (strict) and the tests, the canary tests among them. zsh is installed so the
+  # pyright (strict) and the tests (ruff runs once, in the prek job), the canary tests among them. zsh is installed so the
   # canary's shell-history check runs through a real interactive shell, as on the owner's Mac.
   test:
     runs-on: ubuntu-latest
@@ -75,8 +75,6 @@ jobs:
       - name: Install zsh
         run: sudo apt-get update -q && sudo apt-get install -y -q zsh
       - run: uv sync --frozen
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
       - run: uv run pyright
       - run: uv run pytest
 
