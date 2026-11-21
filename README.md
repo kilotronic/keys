@@ -603,7 +603,11 @@ Agents sign in to GitHub as an App instead of the owner's own login (design: the
   `https://github.com` with `credential.useHttpPath` on, picking the path's owner; it refuses a
   terminal, and leaves other hosts to the next helper.
 - An owner with no installation fails with a message naming it: nothing falls back to the
-  owner's sign-in. The App is named by `--app` or `$KEYS_GH_APP`.
+  owner's sign-in. The App is named by `--app`, else the repo owner's entry in
+  `$KEYS_GH_APPS` (`owner=app` pairs, split by commas or spaces, e.g.
+  `acme-corp=acme-agents jasonluther=kilotronic-agents`). Once the map is set it is the
+  only source: `$KEYS_GH_APP` is ignored and an owner the map doesn't name is refused. Without a
+  map, `$KEYS_GH_APP` names the one App. `--app` is the owner's own override.
 
 ## What is next
 
