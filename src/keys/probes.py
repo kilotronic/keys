@@ -23,6 +23,7 @@ import http.client
 import ipaddress
 import json
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -30,7 +31,7 @@ from collections.abc import Callable
 from email.utils import formatdate
 from typing import Any, cast
 
-from keys import forms, looks
+from keys import appjwt, forms, looks
 from keys.context import UsageError
 from keys.secret import Secret
 
@@ -259,6 +260,50 @@ def _api_key(url: str, header: str, extra: dict[str, str]) -> Callable[[Secret, 
 
 ANTHROPIC = {"anthropic-version": "2023-06-01"}
 
+RAILWAY = "https://backboard.railway.com/graphql/v2"
+GITHUB_JSON = {"Accept": "application/vnd.github+json"}
+
+
+def github_app_request(key: Secret, opts: Options) -> Request:
+    """GET /app with a JWT the App's private key signs: 200 for a key GitHub holds."""
+    token = appjwt.app_jwt(key, opts.client_id or "", int(time.time()))
+    headers = {"Authorization": f"Bearer {token.reveal()}", **GITHUB_JSON}
+    return "GET", "https://api.github.com/app", headers, None
+
+
+def twilio_request(key: Secret, opts: Options) -> Request:
+    """Read the account with the API key's SID and secret (Basic auth)."""
+    basic = base64.b64encode(f"{opts.user}:{key.reveal()}".encode()).decode()
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{opts.account}.json"
+    return "GET", url, {"Authorization": f"Basic {basic}"}, None
+
+
+def _railway(header: str, query: str) -> Callable[[Secret, Options], Request]:
+    def build(k: Secret, o: Options) -> Request:
+        value = k.reveal() if header != "Authorization" else f"Bearer {k.reveal()}"
+        headers = {header: value, "Content-Type": "application/json"}
+        return "POST", RAILWAY, headers, json.dumps({"query": query}).encode()
+
+    return build
+
+
+def railway_verdict(answer: Answer, field: str) -> str:
+    """Railway answers GraphQL with 200 either way: data for a token it knows, an error saying
+    Not Authorized for one it does not. The message is compared here, never printed."""
+    try:
+        doc = cast(dict[str, Any], json.loads(answer.body))
+        data = doc.get("data")
+        errors = doc.get("errors")
+    except (ValueError, AttributeError):
+        return UNKNOWN
+    if isinstance(data, dict) and cast(dict[str, Any], data).get(field) is not None:
+        return WORKS
+    first = cast(list[Any], errors)[0] if isinstance(errors, list) and errors else None
+    if isinstance(first, dict) and cast(dict[str, Any], first).get("message") == "Not Authorized":
+        return DEAD
+    return UNKNOWN
+
+
 PROVIDERS: dict[str, Provider] = {
     p.name: p
     for p in [
@@ -297,6 +342,40 @@ PROVIDERS: dict[str, Provider] = {
             "GitHub token: reads its rate limit",
             _bearer("https://api.github.com/rate_limit", {"Accept": "application/vnd.github+json"}),
             {200},
+            {401},
+        ),
+        Provider(
+            "github-app",
+            "GitHub App private key: reads the App with a JWT it signs; needs --client-id (the "
+            "App's client id or numeric id)",
+            github_app_request,
+            {200},
+            {401},
+            needs=("client_id",),
+            hint=False,  # GitHub's console shows an App key by its SHA-256, not its text
+        ),
+        Provider(
+            "twilio",
+            "Twilio API key (its secret): reads the account; needs --user (the key's SID) and "
+            "--account (the account SID)",
+            twilio_request,
+            {200},
+            {401},
+            needs=("user", "account"),
+            shown_url="https://api.twilio.com/2010-04-01/Accounts/<account>.json",
+        ),
+        Provider(
+            "railway-project",
+            "Railway project token: asks Railway which project it is for",
+            _railway("Project-Access-Token", "query { projectToken { projectId environmentId } }"),
+            set(),
+            {401},
+        ),
+        Provider(
+            "railway",
+            "Railway workspace or account token: lists one project",
+            _railway("Authorization", "query { projects(first: 1) { edges { node { id } } } }"),
+            set(),
             {401},
         ),
         Provider(
@@ -457,7 +536,10 @@ def check_answer(
     for need in provider.needs:
         if not getattr(opts, need, None):
             raise UsageError(f"{provider.name} needs --{need.replace('_', '-')}")
-    method, url, headers, data = provider.build(key, opts)
+    try:
+        method, url, headers, data = provider.build(key, opts)
+    except appjwt.KeyFormatError:
+        return UNKNOWN, "the key is not an RSA private key in PEM form", Answer(0, "")
     target = urllib.parse.urlsplit(url)
     if target.scheme != "https" and not (target.scheme == "http" and _local(target.hostname or "")):
         raise UsageError("keys sends a key only over https (plain http only to this machine)")
@@ -488,6 +570,9 @@ def check_answer(
             return UNKNOWN, f"{reason}: no token status in the answer", answer
         verdict = WORKS if status == "active" else DEAD
         return verdict, reason if status == "active" else f"{reason} ({status})", answer
+    if provider.name.startswith("railway") and answer.status == 200:
+        field = "projectToken" if provider.name == "railway-project" else "projects"
+        return railway_verdict(answer, field), reason, answer
     if provider.verdict is not None:
         settled = provider.verdict(answer.status, raw_code)
         if settled is not None:

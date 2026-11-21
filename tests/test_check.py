@@ -569,3 +569,91 @@ def test_cloudflare_reads_the_token_status(c: Canary, status: str, verdict: str)
     code, out, _ = check(c, ["cloudflare"], 200, body)
     assert verdict in out
     assert code == (0 if verdict == "WORKS" else 1)
+
+
+# ---------------------------------------------------------------------------- phase 2 probes
+
+
+def _jwt_claims(token: str) -> dict[str, Any]:
+    body = token.split(".")[1]
+    return json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+
+
+def test_a_github_app_key_signs_a_jwt_and_reads_the_app(c: Canary) -> None:
+    from tests.test_appjwt import make_key
+
+    pem, _, _ = make_key(1024)
+    code, out, s = check(c, ["github-app", "--client-id", "Iv1.app"], 200, "{}", key=pem)
+    assert code == 0, out
+    method, url, headers, _ = s.calls[0]
+    assert (method, url) == ("GET", "https://api.github.com/app")
+    token = headers["Authorization"].removeprefix("Bearer ")
+    assert _jwt_claims(token)["iss"] == "Iv1.app"
+    assert "WORKS (HTTP 200 from api.github.com/app)" in out
+    # GitHub's console shows a key by its SHA-256, not by its text, so no hint is printed.
+    assert "…" not in out
+    code, out, _ = check(c, ["github-app", "--client-id", "Iv1.app"], 401, "{}", key=pem)
+    assert code == 1
+    assert "DEAD (HTTP 401 from api.github.com/app)" in out
+
+
+def test_a_github_app_probe_needs_the_client_id(c: Canary) -> None:
+    code, out, _ = check(c, ["github-app"], 200)
+    assert code == 3
+    assert "github-app needs --client-id" in out
+
+
+def test_text_that_is_not_an_app_key_is_unknown_and_sends_nothing(c: Canary) -> None:
+    code, out, s = check(c, ["github-app", "--client-id", "1"], 200)
+    assert code == 2
+    assert "UNKNOWN (the key is not an RSA private key in PEM form)" in out
+    assert s.calls == []
+
+
+def test_twilio_reads_the_account_with_the_key_sid(c: Canary) -> None:
+    code, out, s = check(c, ["twilio", "--user", "SK1", "--account", "AC1"], 200, "{}")
+    assert code == 0, out
+    method, url, headers, _ = s.calls[0]
+    assert (method, url) == ("GET", "https://api.twilio.com/2010-04-01/Accounts/AC1.json")
+    sent = base64.b64decode(headers["Authorization"].removeprefix("Basic ")).decode()
+    assert sent == f"SK1:{KEY}"
+    code, out, _ = check(
+        c, ["twilio", "--user", "SK1", "--account", "AC1"], 401, '{"code": 20003, "status": 401}'
+    )
+    assert code == 1
+    assert "DEAD (HTTP 401 from api.twilio.com/2010-04-01/Accounts/<account>.json" in out
+
+
+def test_twilio_needs_the_key_sid_and_the_account(c: Canary) -> None:
+    assert check(c, ["twilio", "--account", "AC1"], 200)[0] == 3
+    assert check(c, ["twilio", "--user", "SK1"], 200)[0] == 3
+
+
+@pytest.mark.parametrize(
+    ("service", "header", "status", "body", "verdict"),
+    [
+        ("railway-project", "Project-Access-Token", 200, '{"data":{"projectToken":{}}}', "WORKS"),
+        (
+            "railway-project",
+            "Project-Access-Token",
+            200,
+            '{"errors":[{"message":"Not Authorized"}],"data":null}',
+            "DEAD",
+        ),
+        ("railway-project", "Project-Access-Token", 200, '{"errors":[{"message":"x"}]}', "UNKNOWN"),
+        ("railway", "Authorization", 200, '{"data":{"projects":{"edges":[]}}}', "WORKS"),
+        ("railway", "Authorization", 200, '{"errors":[{"message":"Not Authorized"}]}', "DEAD"),
+        ("railway", "Authorization", 401, "{}", "DEAD"),
+        ("railway", "Authorization", 200, "{}", "UNKNOWN"),
+    ],
+)
+def test_railway_tokens_ask_graphql(
+    c: Canary, service: str, header: str, status: int, body: str, verdict: str
+) -> None:
+    code, out, s = check(c, [service], status, body)
+    assert verdict in out, out
+    assert code == {"WORKS": 0, "DEAD": 1, "UNKNOWN": 2}[verdict]
+    method, url, headers, data = s.calls[0]
+    assert (method, url) == ("POST", "https://backboard.railway.com/graphql/v2")
+    assert headers[header] in (KEY, f"Bearer {KEY}")
+    assert "query" in json.loads(data or b"{}")

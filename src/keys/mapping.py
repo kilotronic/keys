@@ -73,6 +73,11 @@ TARGETS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
 }
 
 
+# Targets that can receive a non-secret field of the item (`field = ...`): ones keys checks by
+# date or by reading back, not by a fingerprint tag of the key.
+FIELD_TARGETS = ("github-actions", "github-actions-env", "github-actions-org", "railway")
+
+
 class MappingError(Exception):
     """One line per problem, each naming a field, never its content."""
 
@@ -86,6 +91,9 @@ class Target:
     type: str
     fields: dict[str, str | list[str]]
     verify: dict[str, str]
+    # A non-secret field of the item this target receives instead of the key (a Twilio key's
+    # SID next to its secret); empty for the key itself.
+    field: str = ""
 
 
 @dataclass(frozen=True)
@@ -163,7 +171,7 @@ def _target(where: str, raw: object, problems: list[str]) -> Target | None:
         problems.append(f"{where}.type: must be one of {', '.join(TARGETS)}")
         return None
     required, optional = TARGETS[kind]
-    allowed = {"type", "verify", *required, *optional}
+    allowed = {"type", "verify", "field", *required, *optional}
     fields: dict[str, str | list[str]] = {}
     for key in t:
         if key not in allowed:
@@ -197,7 +205,15 @@ def _target(where: str, raw: object, problems: list[str]) -> Target | None:
                     verify[k] = v
                 else:
                     problems.append(f"{where}.verify: each value must be text")
-    return Target(kind, fields, verify)
+    delivered = ""
+    if "field" in t:
+        delivered = t["field"] if isinstance(t["field"], str) else ""
+        if not re.fullmatch(r"[a-z][a-z_]{0,31}", delivered):
+            problems.append(f"{where}.field: must name a field of the item")
+            delivered = ""
+        elif kind not in FIELD_TARGETS:
+            problems.append(f"{where}.field: only {', '.join(FIELD_TARGETS)} targets take one")
+    return Target(kind, fields, verify, delivered)
 
 
 def _credential(
@@ -291,6 +307,10 @@ def _credential(
     else:
         for j, rt in enumerate(cast(list[object], raw_targets)):
             t = _target(f"{where}.target[{j}]", rt, problems)
+            known = isinstance(kind, str) and kind in KINDS
+            if t and t.field and known and t.field not in KINDS[cast(str, kind)].fields:
+                names = ", ".join(KINDS[cast(str, kind)].fields) or "none"
+                problems.append(f"{where}.target[{j}].field: a {kind} item's fields are {names}")
             if t:
                 targets.append(t)
 

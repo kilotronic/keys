@@ -73,6 +73,7 @@ def run(args: argparse.Namespace, ctx: Context) -> int:
     fp_key = read_fp_key(args.fp_key, ctx)
     op = Op(environ)
     values: list[tuple[mapping.Credential, list[targets.Adapter], Secret, str]] = []
+    extra: dict[tuple[str, str], tuple[Secret, str]] = {}  # (credential, field): value, fp
     for c, ads in plan:
         if not ads:
             ctx.say(f"{c.name}: no targets")
@@ -85,6 +86,16 @@ def run(args: argparse.Namespace, ctx: Context) -> int:
             raise UsageError(f"{c.name}: its 1Password value is empty; paste it there first")
         value = targets.normalise(value, c.name)
         values.append((c, ads, value, fingerprint(fp_key, value)))
+        for a in ads:  # a target that takes a non-secret field of the item (a key's SID)
+            name = a.target.field
+            if name and (c.name, name) not in extra:
+                try:
+                    got = targets.normalise(op.read(f"{c.item}/{name}"), c.name)
+                except OpError as e:
+                    raise UsageError(f"could not read {c.name}'s {name} field: {e}") from None
+                if not got.reveal().strip():
+                    raise UsageError(f"{c.name}: its item's {name} field is empty")
+                extra[(c.name, name)] = (got, fingerprint(fp_key, got))
 
     for c, _, _, _ in values:
         if not c.fp:
@@ -113,8 +124,9 @@ def run(args: argparse.Namespace, ctx: Context) -> int:
         names = ", ".join(r.service_label() for r in rs)
         return f"; staged but not redeployed: {names}" if rs else ""
 
-    for c, ads, value, fp in values:
+    for c, ads, main, main_fp in values:
         for a in ads:
+            value, fp = extra.get((c.name, a.target.field), (main, main_fp))
             try:
                 a.write(value, fp)
             except targets.PartialWrite as e:
