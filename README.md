@@ -56,6 +56,30 @@ old-token  github-pat  -            -           -     -         no expiry; rotat
 2 credentials kept, 1 with problems
 ```
 
+### `keys check <service> --key <source>`
+
+Asks the service that issued a key whether it still works, with one free, read-only call, and
+prints one line: the service, the key's fingerprint, the hint the service's console shows, and
+the verdict (WORKS, DEAD or UNKNOWN) with the HTTP status and the service's error code.
+
+```text
+$ keys check github --key op://<vault>/<item>/credential --expect dead
+github key fp:3f9a1c02 github_p…Ab3d: DEAD (HTTP 401 from api.github.com/rate_limit)
+```
+
+- The key comes from `op://…` (read in memory through 1Password), `env:NAME` or `stdin`, never
+  the command line. A source keys does not know is not repeated back.
+- `fp:` is the first 8 hex digits of an HMAC-SHA-256 keyed by a fingerprint secret, from
+  `--fp-key` or `$KEYS_FP_KEY` (same source forms), so a short key cannot be guessed from it.
+- Nothing a service or a program says is passed through: only the status, an error code that
+  holds no piece of the key, and for a network failure its type. When 1Password fails, only
+  `op`'s exit code is shown. Programs keys starts see only a few basic variables of its
+  environment, so a key handed to keys in a variable never reaches them.
+- `keys check --list` names the services. `http` covers any HTTPS API (`--url`, then
+  `--header 'Name: {key}'`, `--bearer` or `--query NAME`).
+- Exit 0 for WORKS (or the `--expect` verdict), 1 for DEAD (or the other), 2 for UNKNOWN, 3 for
+  a usage error.
+
 ## The canary tests
 
 Every command's tests run through one harness, `tests/canary.py`. It plants a made-up value in
