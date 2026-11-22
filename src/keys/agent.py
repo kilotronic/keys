@@ -1,10 +1,12 @@
 """Agents sign in to GitHub as an App: `keys install-key`, `keys gh` and `keys git-credential`.
 
-The App's private key goes from 1Password into one login-keychain item, once, so minting needs
-no Touch ID. Each `keys gh` call mints a one-hour installation token for the repo's owner, hands
-it to the real gh only in gh's environment, and revokes it when gh ends. `keys git-credential`
-answers git's credential protocol on a pipe. An owner with no installation fails with a message
-naming it; nothing ever falls back to the owner's own sign-in, and no value is printed or written.
+The App's private key goes from 1Password into one login-keychain item on a Mac (elsewhere, a
+file only its owner can read, under ~/.config/keys/app-keys), once, so minting needs no Touch ID.
+Each `keys gh` call mints a one-hour installation token for the repo's owner, hands it to the real
+gh only in gh's environment, and revokes it when gh ends. `keys git-credential` answers git's
+credential protocol on a pipe. An owner with no installation fails with a message naming it;
+nothing ever falls back to the owner's own sign-in, and no value is printed, nor written anywhere
+but that one keychain item or key file.
 """
 
 from __future__ import annotations
@@ -113,6 +115,20 @@ class Deps:
     send: Sender = _SEND
     now: Callable[[], float] = time.time
     exec_gh: Callable[[Sequence[str], Mapping[str, str]], int] | None = None
+    # Where install-key keeps the key: the login keychain on a Mac, else a 0600 file in key_dir.
+    platform: str = sys.platform
+    key_dir: Path | None = None
+
+
+def _key_file(name: str, deps: Deps) -> Path:
+    if deps.key_dir is not None:
+        return deps.key_dir / f"{name}.json"
+    config = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(config) / "keys" / "app-keys" / f"{name}.json"
+
+
+def _store_name(deps: Deps) -> str:
+    return "the login keychain" if deps.platform == "darwin" else "its key file"
 
 
 # ── The keychain ─────────────────────────────────────────────────────────────
@@ -123,9 +139,13 @@ def _service(name: str) -> str:
 
 
 def store_key(name: str, pem: Secret, client_id: str, deps: Deps) -> None:
-    """Write the key to the login keychain through `security -i` on stdin, never argv."""
+    """Write the key to the login keychain through `security -i` on stdin, never argv; off a Mac,
+    to a file only its owner can read."""
     if not CLIENT_ID.fullmatch(client_id):
         raise UsageError("the item's client_id field does not look like a GitHub App client id")
+    if deps.platform != "darwin":
+        _store_file(name, pem, client_id, deps)
+        return
     blob = base64.b64encode(pem.reveal().encode()).decode()
     line = f'add-generic-password -U -a {ACCOUNT} -s {_service(name)} -j "{client_id}" -w {blob}\n'
     code, _ = deps.run(["security", "-i"], line.encode(), {})
@@ -133,8 +153,52 @@ def store_key(name: str, pem: Secret, client_id: str, deps: Deps) -> None:
         raise AgentError(f"the keychain refused the key for {name} (security exited {code})")
 
 
+def _store_file(name: str, pem: Secret, client_id: str, deps: Deps) -> None:
+    """Write {"client_id", "pem"} to the key file: folder 0700, file 0600, made under a temporary
+    name and renamed into place, so no reader sees half a key or a wider mode."""
+    path = _key_file(name, deps)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}")
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
+        tmp.unlink(missing_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(json.dumps({"client_id": client_id, "pem": pem.reveal()}).encode())
+        os.replace(tmp, path)
+    except OSError as e:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+        raise AgentError(f"could not write the key file for {name} ({type(e).__name__})") from None
+
+
+def _load_file(name: str, deps: Deps) -> tuple[Secret, str]:
+    path = _key_file(name, deps)
+    try:
+        mode = path.stat().st_mode
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        raise AgentError(f"no key file for {name}: run `keys install-key {name}`") from None
+    except OSError as e:
+        raise AgentError(f"could not read the key file for {name} ({type(e).__name__})") from None
+    if mode & 0o077:
+        raise AgentError(f"the key file for {name} is readable by others: rerun install-key")
+    try:
+        data = json.loads(raw)
+        pem, client_id = data["pem"], data["client_id"]
+    except (ValueError, KeyError, TypeError):
+        raise AgentError(f"the key file for {name} is not one install-key wrote") from None
+    if not isinstance(pem, str) or not isinstance(client_id, str) or "PRIVATE KEY" not in pem:
+        raise AgentError(f"the key file for {name} is not one install-key wrote")
+    if not CLIENT_ID.fullmatch(client_id):
+        raise AgentError(f"the key file for {name} has no client id: rerun install-key")
+    return Secret(pem), client_id
+
+
 def load_key(name: str, deps: Deps) -> tuple[Secret, str]:
-    """The key and client id from the keychain item `install-key` wrote."""
+    """The key and client id from the keychain item (off a Mac, the file) install-key wrote."""
+    if deps.platform != "darwin":
+        return _load_file(name, deps)
     code, out = deps.run(
         ["security", "find-generic-password", "-a", ACCOUNT, "-s", _service(name), "-w"], None, {}
     )
@@ -412,12 +476,14 @@ def install(args: argparse.Namespace, ctx: Context, deps: Deps | None = None) ->
     store_key(args.name, pem, client_id, deps)
     stored, stored_id = load_key(args.name, deps)
     if stored != pem or stored_id != client_id:
-        raise AgentError(f"the keychain did not keep {args.name}'s key: nothing usable was stored")
+        raise AgentError(
+            f"{_store_name(deps)} did not keep {args.name}'s key: nothing usable was stored"
+        )
     a = deps.send("GET", f"{API}/app", _headers(app_jwt(stored, stored_id, deps)), None)
     if a.status != 200:
         ctx.warn(f"keys: stored, but GitHub answered {a.status or a.error} signing in as the App")
         return EXIT_FAIL
-    ctx.say(f"stored {args.name} in the login keychain; it signs in as its App")
+    ctx.say(f"stored {args.name} in {_store_name(deps)}; it signs in as its App")
     return EXIT_OK
 
 

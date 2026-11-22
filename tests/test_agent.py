@@ -74,7 +74,13 @@ class Fakes:
         return self.gh_code
 
     def deps(self) -> agent.Deps:
-        return agent.Deps(run=self.run, send=self.send, now=lambda: 1_000_000, exec_gh=self.exec_gh)
+        return agent.Deps(
+            run=self.run,
+            send=self.send,
+            now=lambda: 1_000_000,
+            exec_gh=self.exec_gh,
+            platform="darwin",
+        )
 
 
 class TTY(io.StringIO):
@@ -333,6 +339,44 @@ def test_the_key_reaches_the_keychain_on_stdin_never_argv() -> None:
     assert PEM not in " ".join(argv)
     assert "MIIfake" not in " ".join(argv)
     assert base64.b64encode(PEM.encode()).decode() in (stdin or b"").decode()
+
+
+def test_off_a_mac_the_key_goes_to_a_file_only_its_owner_can_read(tmp_path: Path) -> None:
+    f = Fakes()
+    deps = f.deps()
+    deps.platform, deps.key_dir = "linux", tmp_path / "app-keys"
+    agent.store_key("kilotronic-agents", agent.Secret(PEM), "Iv23clientid", deps)
+    path = tmp_path / "app-keys" / "kilotronic-agents.json"
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert path.parent.stat().st_mode & 0o777 == 0o700
+    assert not f.runs  # no `security`, no child at all
+    pem, client_id = agent.load_key("kilotronic-agents", deps)
+    assert pem == agent.Secret(PEM)
+    assert client_id == "Iv23clientid"
+    assert [p.name for p in path.parent.iterdir()] == [path.name]  # no temporary file left
+
+
+def test_a_key_file_others_can_read_is_refused(tmp_path: Path) -> None:
+    deps = Fakes().deps()
+    deps.platform, deps.key_dir = "linux", tmp_path
+    agent.store_key("kilotronic-agents", agent.Secret(PEM), "Iv23clientid", deps)
+    (tmp_path / "kilotronic-agents.json").chmod(0o644)
+    with pytest.raises(agent.AgentError, match="readable by others") as e:
+        agent.load_key("kilotronic-agents", deps)
+    assert "MIIfake" not in str(e.value)
+
+
+def test_a_missing_or_foreign_key_file_names_install_key(tmp_path: Path) -> None:
+    deps = Fakes().deps()
+    deps.platform, deps.key_dir = "linux", tmp_path
+    with pytest.raises(agent.AgentError, match="keys install-key kilotronic-agents"):
+        agent.load_key("kilotronic-agents", deps)
+    bad = tmp_path / "kilotronic-agents.json"
+    bad.write_text('{"pem": "MIIfake"}')
+    bad.chmod(0o600)
+    with pytest.raises(agent.AgentError, match="not one install-key wrote") as e:
+        agent.load_key("kilotronic-agents", deps)
+    assert "MIIfake" not in str(e.value)
 
 
 def test_a_client_id_that_could_break_the_keychain_line_is_refused() -> None:
@@ -639,7 +683,9 @@ def test_git_credential_quits_on_an_unexpected_failure() -> None:
         raise RuntimeError("unexpected")
 
     deps = f.deps()
-    deps = agent.Deps(run=deps.run, send=boom, now=deps.now, exec_gh=deps.exec_gh)
+    deps = agent.Deps(
+        run=deps.run, send=boom, now=deps.now, exec_gh=deps.exec_gh, platform="darwin"
+    )
     c = map_only(stdin=GIT_IN.format(path="acme-corp/widgets.git"))
     with pytest.raises(RuntimeError):
         agent.git_credential(argparse.Namespace(app=None, operation="get"), c, deps)

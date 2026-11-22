@@ -102,7 +102,10 @@ def _parser(ctx: Context, argv: Sequence[str]) -> _Parser:
     )
     rotating.configure(add("rotate", "replace a credential end to end: make, store, sync, revoke"))
     agent.configure_install(
-        add("install-key", "copy a GitHub App key from 1Password into the login keychain, once")
+        add(
+            "install-key",
+            "copy a GitHub App key from 1Password into the keychain (off a Mac, a file), once",
+        )
     )
     agent.configure_gh(
         add("gh", "run gh as the agents' GitHub App, with a token minted for the call")
