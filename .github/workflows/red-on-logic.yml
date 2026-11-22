@@ -1,6 +1,6 @@
 name: red-on-logic
 
-# A pilot of kilotronic/red-on-logic: a pull request's new or changed tests must fail on the base
+# A pilot of kilotronic/checks/red-on-logic: a pull request's new or changed tests must fail on the base
 # branch's code with a wrong answer, not an import error. It is not part of `ci`, so it is not
 # required; the owner decides that after the pilot. Labels re-run it: a label
 # `red-on-logic: not applicable (<reason>)`, or the same line as a commit trailer, skips it.
@@ -33,7 +33,7 @@ jobs:
       - name: Install zsh
         run: sudo apt-get update -q && sudo apt-get install -y -q zsh
       - run: uv sync --frozen
-      - uses: kilotronic/red-on-logic@d4d917fdf79511432fdbb2588975f48369fdac0c # v1.1.0
+      - uses: kilotronic/checks/red-on-logic@a6e8917fddb679077a2e8a427598ff1fd7a160ef # v1.0.0
         with:
           # keys' own words for a name the old code does not know: an option, a command or
           # a provider the branch adds. Failing on them is red on import, not a wrong answer.
