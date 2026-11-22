@@ -41,3 +41,4 @@ jobs:
             unrecognized arguments
             invalid choice
             unknown service
+            ^SystemExit: 2$
