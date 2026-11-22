@@ -123,8 +123,11 @@ class Deps:
 def _key_file(name: str, deps: Deps) -> Path:
     if deps.key_dir is not None:
         return deps.key_dir / f"{name}.json"
-    config = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
-    return Path(config) / "keys" / "app-keys" / f"{name}.json"
+    # A relative XDG_CONFIG_HOME is ignored (as the spec says): it would put the key inside
+    # whatever folder install-key ran in, a repo perhaps.
+    config = os.environ.get("XDG_CONFIG_HOME", "")
+    base = Path(config) if os.path.isabs(config) else Path.home() / ".config"
+    return base / "keys" / "app-keys" / f"{name}.json"
 
 
 def _store_name(deps: Deps) -> str:
@@ -174,15 +177,20 @@ def _store_file(name: str, pem: Secret, client_id: str, deps: Deps) -> None:
 
 def _load_file(name: str, deps: Deps) -> tuple[Secret, str]:
     path = _key_file(name, deps)
+    # One open, not following a link; mode and owner are checked on that same open file.
     try:
-        mode = path.stat().st_mode
-        raw = path.read_bytes()
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except FileNotFoundError:
         raise AgentError(f"no key file for {name}: run `keys install-key {name}`") from None
     except OSError as e:
         raise AgentError(f"could not read the key file for {name} ({type(e).__name__})") from None
-    if mode & 0o077:
-        raise AgentError(f"the key file for {name} is readable by others: rerun install-key")
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if st.st_mode & 0o077 or st.st_uid != os.getuid():
+            raise AgentError(
+                f"the key file for {name} is readable by others or not yours: rerun install-key"
+            )
+        raw = f.read()
     try:
         data = json.loads(raw)
         pem, client_id = data["pem"], data["client_id"]
@@ -466,7 +474,7 @@ def install(args: argparse.Namespace, ctx: Context, deps: Deps | None = None) ->
     from keys.op import Op
 
     deps = deps or Deps()
-    if not NAME.match(args.name):
+    if not NAME.fullmatch(args.name):
         raise UsageError("a credential name is lower-case letters, digits and dashes")
     path = Path(args.mapping or ctx.environ.get("KEYS_MAPPING") or "keys.toml")
     entry = next((c for c in load(path).credentials if c.name == args.name), None)
@@ -494,7 +502,7 @@ def install(args: argparse.Namespace, ctx: Context, deps: Deps | None = None) ->
 def has_key(args: argparse.Namespace, ctx: Context, deps: Deps | None = None) -> int:
     """Whether install-key's key is here and readable, so a setup script needn't know where."""
     deps = deps or Deps()
-    if not NAME.match(args.name):
+    if not NAME.fullmatch(args.name):
         raise UsageError("a credential name is lower-case letters, digits and dashes")
     try:
         load_key(args.name, deps)

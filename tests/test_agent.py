@@ -720,3 +720,26 @@ def test_has_key_answers_by_exit_code_and_prints_nothing(tmp_path: Path) -> None
     f = Fakes()
     f.keychain = None
     assert agent.has_key(ns, c, f.deps()) == agent.EXIT_FAIL
+
+
+def test_a_relative_xdg_config_home_is_ignored(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", ".config")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    deps = agent.Deps(platform="linux")
+    path = agent._key_file("kilotronic-agents", deps)  # pyright: ignore[reportPrivateUsage]
+    assert path == tmp_path / ".config" / "keys" / "app-keys" / "kilotronic-agents.json"
+
+
+def test_a_key_file_that_is_a_link_is_refused(tmp_path: Path) -> None:
+    deps = Fakes().deps()
+    deps.platform, deps.key_dir = "linux", tmp_path / "real"
+    agent.store_key("kilotronic-agents", agent.Secret(PEM), "Iv23clientid", deps)
+    (tmp_path / "linked").mkdir()
+    (tmp_path / "linked" / "kilotronic-agents.json").symlink_to(
+        tmp_path / "real" / "kilotronic-agents.json"
+    )
+    deps.key_dir = tmp_path / "linked"
+    with pytest.raises(agent.AgentError, match="could not read"):
+        agent.load_key("kilotronic-agents", deps)
