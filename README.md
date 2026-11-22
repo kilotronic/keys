@@ -596,6 +596,13 @@ Agents sign in to GitHub as an App instead of the owner's own login (design: the
   to `~/.config/keys/app-keys/<name>.json` (`$XDG_CONFIG_HOME` if set): the folder `0700`, the file
   `0600`, written under a temporary name and renamed into place; `keys gh` refuses a key file
   anyone else can read. It then signs in as the App once to prove the key.
+- `keys send-key <name> <host>... [--mapping PATH]` is for Linux machines with no 1Password of
+  their own. It reads the key and client id from 1Password on this machine (in memory), signs in
+  as the App once to prove them, and writes them into each host's key file over ssh, on stdin:
+  never in an argument, never in a local file. On the host the file is written as `install-key`
+  writes it (folder `0700`, file `0600`, renamed into place). A host is a name, an ssh_config
+  alias or `user@host`; anything else is refused. One failed host doesn't stop the rest; the
+  exit code is 1 if any failed.
 - `keys gh [--app NAME] -- <gh args>` mints a one-hour installation token for the call's owner
   (from `-R`, `--repo=`, `$GH_REPO`, a github.com URL, a `gh api` path, `--owner` (as
   `gh project` takes it; the token then covers the whole installation), `$KEYS_GH_OWNER` (for a

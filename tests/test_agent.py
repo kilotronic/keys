@@ -743,3 +743,86 @@ def test_a_key_file_that_is_a_link_is_refused(tmp_path: Path) -> None:
     deps.key_dir = tmp_path / "linked"
     with pytest.raises(agent.AgentError, match="could not read"):
         agent.load_key("kilotronic-agents", deps)
+
+
+def test_send_key_goes_over_ssh_on_stdin_never_argv() -> None:
+    f = Fakes()
+    seen: list[list[str]] = []
+
+    def run(
+        argv: Sequence[str], stdin: bytes | None, fds: Mapping[int, bytes]
+    ) -> tuple[int, bytes]:
+        seen.append(list(argv))
+        assert stdin is not None
+        assert json.loads(stdin) == {"client_id": "Iv23clientid", "pem": PEM}
+        return 0, b""
+
+    deps = f.deps()
+    deps.run = run
+    agent.send_key_to(
+        "kilotronic-agents", agent.Secret(PEM), "Iv23clientid", "user@box.example.test", deps
+    )
+    ((argv),) = seen
+    assert "-T" in argv
+    assert "StrictHostKeyChecking=yes" in argv
+    assert "RemoteCommand=none" in argv
+    assert argv[-3:-1] == ["--", "user@box.example.test"]
+    assert "MIIfake" not in " ".join(argv)
+    assert 'mv -f "$t" "$d/kilotronic-agents.json"' in argv[-1]
+    assert "umask 077" in argv[-1]
+
+
+@pytest.mark.parametrize(
+    "host", ["-oProxyCommand=x", "box.example.test;rm -rf ~", "a b", "", "box$(id)"]
+)
+def test_send_key_refuses_a_host_that_is_not_a_plain_name(host: str) -> None:
+    with pytest.raises(UsageError):
+        agent.send_key_to(
+            "kilotronic-agents", agent.Secret(PEM), "Iv23clientid", host, Fakes().deps()
+        )
+
+
+def test_send_key_names_a_host_ssh_could_not_write_and_no_value() -> None:
+    deps = Fakes().deps()
+    deps.run = lambda argv, stdin, fds: (255, b"")
+    with pytest.raises(agent.AgentError, match=r"on box2\.example\.test") as e:
+        agent.send_key_to(
+            "kilotronic-agents", agent.Secret(PEM), "Iv23clientid", "box2.example.test", deps
+        )
+    assert "MIIfake" not in str(e.value)
+
+
+@pytest.mark.parametrize("shell", ["sh", "bash", "zsh"])
+def test_the_remote_script_writes_the_file_load_key_reads(tmp_path: Path, shell: str) -> None:
+    """Run the script ssh would run, in a local shell, and read the result back with load_key."""
+    import shutil
+
+    if not shutil.which(shell):
+        pytest.skip(f"no {shell}")
+    env = {"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"}
+    blob = json.dumps({"client_id": "Iv23clientid", "pem": PEM}).encode()
+    script = agent.remote_script("kilotronic-agents", len(blob))
+    subprocess.run([shell, "-c", script], input=blob, env=env, check=True)
+    deps = Fakes().deps()
+    deps.platform, deps.key_dir = "linux", tmp_path / ".config" / "keys" / "app-keys"
+    assert agent.load_key("kilotronic-agents", deps) == (agent.Secret(PEM), "Iv23clientid")
+    assert deps.key_dir.stat().st_mode & 0o777 == 0o700
+
+
+def test_a_cut_off_upload_keeps_the_old_key_and_leaves_no_temp_file(tmp_path: Path) -> None:
+    env = {"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"}
+    good = json.dumps({"client_id": "Iv23clientid", "pem": PEM}).encode()
+    subprocess.run(
+        ["sh", "-c", agent.remote_script("kilotronic-agents", len(good))],
+        input=good,
+        env=env,
+        check=True,
+    )
+    cut = good[:20]
+    r = subprocess.run(
+        ["sh", "-c", agent.remote_script("kilotronic-agents", len(good))], input=cut, env=env
+    )
+    assert r.returncode == 1
+    d = tmp_path / ".config" / "keys" / "app-keys"
+    assert [p.name for p in d.iterdir()] == ["kilotronic-agents.json"]
+    assert json.loads((d / "kilotronic-agents.json").read_text())["pem"] == PEM

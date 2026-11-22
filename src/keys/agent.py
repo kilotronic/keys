@@ -469,11 +469,12 @@ def _app(args: argparse.Namespace, ctx: Context, owner: str) -> str:
     return name
 
 
-def install(args: argparse.Namespace, ctx: Context, deps: Deps | None = None) -> int:
+def _read_app_key(args: argparse.Namespace, ctx: Context) -> tuple[Secret, str]:
+    """The App's private key and client id, read in memory from the 1Password item the mapping
+    names."""
     from keys.mapping import load
     from keys.op import Op
 
-    deps = deps or Deps()
     if not NAME.fullmatch(args.name):
         raise UsageError("a credential name is lower-case letters, digits and dashes")
     path = Path(args.mapping or ctx.environ.get("KEYS_MAPPING") or "keys.toml")
@@ -485,6 +486,14 @@ def install(args: argparse.Namespace, ctx: Context, deps: Deps | None = None) ->
     client_id = op.read(f"{entry.item}/client_id").reveal().strip()
     if "PRIVATE KEY" not in pem.reveal():
         raise UsageError(f"{args.name}'s credential field holds no private key")
+    if not CLIENT_ID.fullmatch(client_id):
+        raise UsageError("the item's client_id field does not look like a GitHub App client id")
+    return pem, client_id
+
+
+def install(args: argparse.Namespace, ctx: Context, deps: Deps | None = None) -> int:
+    deps = deps or Deps()
+    pem, client_id = _read_app_key(args, ctx)
     store_key(args.name, pem, client_id, deps)
     stored, stored_id = load_key(args.name, deps)
     if stored != pem or stored_id != client_id:
@@ -497,6 +506,83 @@ def install(args: argparse.Namespace, ctx: Context, deps: Deps | None = None) ->
         return EXIT_FAIL
     ctx.say(f"stored {args.name} in {_store_name(deps)}; it signs in as its App")
     return EXIT_OK
+
+
+# A host as ssh takes it: a name, an ssh_config alias or user@host. Never a leading dash (an
+# ssh option) and nothing a shell would read.
+HOST = re.compile(r"^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def remote_script(name: str, size: int) -> str:
+    """Write stdin to the host's key file the way _store_file does: folder 0700, file 0600, made
+    under a temporary name and renamed into place. A relative XDG_CONFIG_HOME is ignored there too.
+    The rename happens only when all `size` bytes arrived, so a dropped connection leaves the old
+    key in place; any failure removes the temporary file. Runs in sh, bash or zsh."""
+    if not NAME.fullmatch(name):
+        raise UsageError("a credential name is lower-case letters, digits and dashes")
+    return (
+        'case "${XDG_CONFIG_HOME:-}" in /*) c=$XDG_CONFIG_HOME ;; *) c=$HOME/.config ;; esac; '
+        'd="$c/keys/app-keys"; umask 077; mkdir -p "$d" && chmod 700 "$d" || exit 1; '
+        f't="$d/.{name}.json.$$"; '
+        f'if cat >"$t" && [ "$(wc -c <"$t" | tr -d " ")" = {size} ] && chmod 600 "$t" '
+        f'&& mv -f "$t" "$d/{name}.json"; then exit 0; fi; rm -f "$t"; exit 1'
+    )
+
+
+def send_key_to(name: str, pem: Secret, client_id: str, host: str, deps: Deps) -> None:
+    """Send the key to one host over ssh, on stdin: never argv, never a local file."""
+    if not HOST.fullmatch(host):
+        raise UsageError(f"{host!r} is not a host ssh can take here")
+    blob = json.dumps({"client_id": client_id, "pem": pem.reveal()}).encode()
+    argv = [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=15",
+        # No terminal (it would echo stdin back) and no RemoteCommand from ssh_config; and only
+        # a host whose key ssh already knows gets the App key.
+        "-T",
+        "-o",
+        "RemoteCommand=none",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "--",
+        host,
+        remote_script(name, len(blob)),
+    ]
+    code, _ = deps.run(argv, blob, {})
+    if code != 0:
+        raise AgentError(f"could not write {name}'s key on {host} (ssh exited {code})")
+
+
+def configure_send(p: argparse.ArgumentParser) -> None:
+    p.add_argument("name", help="the credential's name in the mapping file")
+    p.add_argument("hosts", nargs="+", metavar="host", help="hosts ssh can reach (Linux)")
+    p.add_argument("--mapping", help="the mapping file (default: $KEYS_MAPPING, else ./keys.toml)")
+
+
+def send_key(args: argparse.Namespace, ctx: Context, deps: Deps | None = None) -> int:
+    """Read the key from 1Password here, prove it signs in, and write it into each host's key file
+    over ssh, for machines with no 1Password of their own."""
+    deps = deps or Deps()
+    bad = [h for h in args.hosts if not HOST.fullmatch(h)]
+    if bad:
+        raise UsageError(f"not a host ssh can take here: {', '.join(map(repr, bad))}")
+    pem, client_id = _read_app_key(args, ctx)
+    a = deps.send("GET", f"{API}/app", _headers(app_jwt(pem, client_id, deps)), None)
+    if a.status != 200:
+        ctx.warn(f"keys: GitHub answered {a.status or a.error} signing in as the App; nothing sent")
+        return EXIT_FAIL
+    failed = 0
+    for host in args.hosts:
+        try:
+            send_key_to(args.name, pem, client_id, host, deps)
+            ctx.say(f"{host}: {args.name}'s key is in its key file")
+        except AgentError as e:
+            failed += 1
+            ctx.warn(f"keys: {e}")
+    return EXIT_FAIL if failed else EXIT_OK
 
 
 def has_key(args: argparse.Namespace, ctx: Context, deps: Deps | None = None) -> int:
