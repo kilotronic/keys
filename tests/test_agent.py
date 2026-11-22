@@ -706,3 +706,17 @@ def test_a_crafted_owner_is_refused_on_every_app_source() -> None:
     with pytest.raises(UsageError):
         agent.gh(gh_args("api", "https://github.com/..%2Fusers/x", app="k-agents"), ctx(), f.deps())
     assert f.sends == []
+
+
+def test_has_key_answers_by_exit_code_and_prints_nothing(tmp_path: Path) -> None:
+    deps = Fakes().deps()
+    deps.platform, deps.key_dir = "linux", tmp_path
+    c = map_only()
+    ns = argparse.Namespace(name="kilotronic-agents")
+    assert agent.has_key(ns, c, deps) == agent.EXIT_FAIL
+    agent.store_key("kilotronic-agents", agent.Secret(PEM), "Iv23clientid", deps)
+    assert agent.has_key(ns, c, deps) == agent.EXIT_OK
+    assert out(c) == ""
+    f = Fakes()
+    f.keychain = None
+    assert agent.has_key(ns, c, f.deps()) == agent.EXIT_FAIL

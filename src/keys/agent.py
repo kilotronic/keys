@@ -402,6 +402,10 @@ def configure_install(p: argparse.ArgumentParser) -> None:
     p.add_argument("--mapping", help="the mapping file (default: $KEYS_MAPPING, else ./keys.toml)")
 
 
+def configure_has_key(p: argparse.ArgumentParser) -> None:
+    p.add_argument("name", help="the App credential's name, as install-key took it")
+
+
 def configure_gh(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--app",
@@ -484,6 +488,18 @@ def install(args: argparse.Namespace, ctx: Context, deps: Deps | None = None) ->
         ctx.warn(f"keys: stored, but GitHub answered {a.status or a.error} signing in as the App")
         return EXIT_FAIL
     ctx.say(f"stored {args.name} in {_store_name(deps)}; it signs in as its App")
+    return EXIT_OK
+
+
+def has_key(args: argparse.Namespace, ctx: Context, deps: Deps | None = None) -> int:
+    """Whether install-key's key is here and readable, so a setup script needn't know where."""
+    deps = deps or Deps()
+    if not NAME.match(args.name):
+        raise UsageError("a credential name is lower-case letters, digits and dashes")
+    try:
+        load_key(args.name, deps)
+    except AgentError:
+        return EXIT_FAIL
     return EXIT_OK
 
 
