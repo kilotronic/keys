@@ -18,8 +18,8 @@ concurrency:
 
 jobs:
   red-on-logic:
-    # Dependabot's updates change no tests and cannot add a skip trailer.
-    if: github.actor != 'dependabot[bot]'
+    # Update bots' pull requests change no tests and cannot add a skip trailer.
+    if: github.actor != 'dependabot[bot]' && github.actor != 'renovate[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

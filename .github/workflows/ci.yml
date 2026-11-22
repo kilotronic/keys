@@ -53,7 +53,7 @@ jobs:
       - uses: kilotronic/git-identity@b0d54e809d81cabf61d357cbe519a9b9263b17cb # v2.4.0
         with:
           domains: ixid.net, kilotronic.com
-          allow-bots: dependabot
+          allow-bots: dependabot, renovate
           commit-subject: true
 
   # ruff, pyright (strict) and the tests, the canary tests among them. zsh is installed so the
