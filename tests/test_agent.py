@@ -49,7 +49,7 @@ class Fakes:
         if argv[0] == "openssl":
             return 0, JWT_SIG
         if argv[0] == "git":
-            return 0, b"git@github.com:jasonluther/partygame.git\n"
+            return 0, b"git@github.com:jasonluther/demo-app.git\n"
         raise AssertionError(f"unexpected child {argv}")
 
     def send(self, method: str, url: str, headers: dict[str, str], data: bytes | None) -> Answer:
@@ -132,8 +132,8 @@ def gh_args(*rest: str, app: str | None = None) -> argparse.Namespace:
         (
             ["pr", "list"],
             {},
-            "git@github.com:jasonluther/partygame.git",
-            ("jasonluther", "partygame"),
+            "git@github.com:jasonluther/demo-app.git",
+            ("jasonluther", "demo-app"),
         ),
         (["pr", "list"], {}, "https://github.com/kilotronic/keys.git", ("kilotronic", "keys")),
         (["auth", "status"], {"KEYS_GH_DEFAULT_OWNER": "jasonluther"}, None, ("jasonluther", None)),
@@ -142,13 +142,13 @@ def gh_args(*rest: str, app: str | None = None) -> argparse.Namespace:
         (
             ["project", "view", "1", "--owner", "example-org"],
             {},
-            "git@github.com:jasonluther/partygame.git",
+            "git@github.com:jasonluther/demo-app.git",
             ("example-org", None),
         ),
         (
             ["project", "item-edit", "--id", "PVTI_x", "--project-id", "PVT_y"],
             {"KEYS_GH_OWNER": "example-org", "KEYS_GH_DEFAULT_OWNER": "jasonluther"},
-            "git@github.com:jasonluther/partygame.git",
+            "git@github.com:jasonluther/demo-app.git",
             ("example-org", None),
         ),
         (
@@ -197,10 +197,10 @@ def test_gh_gets_the_token_only_in_its_environment_and_it_is_revoked() -> None:
     c = ctx(
         environ={"GITHUB_PERSONAL_ACCESS_TOKEN": "owner-admin", "GITHUB_TOKEN": "x", "HOME": "/h"}
     )
-    code = agent.gh(gh_args("pr", "list", "-R", "jasonluther/partygame"), c, f.deps())
+    code = agent.gh(gh_args("pr", "list", "-R", "jasonluther/demo-app"), c, f.deps())
     assert code == 0
     ((argv, env),) = f.gh_calls
-    assert argv == ["/opt/homebrew/bin/gh", "pr", "list", "-R", "jasonluther/partygame"]
+    assert argv == ["/opt/homebrew/bin/gh", "pr", "list", "-R", "jasonluther/demo-app"]
     assert env["GH_TOKEN"] == TOKEN
     assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in env
     assert "GITHUB_TOKEN" not in env
@@ -212,14 +212,14 @@ def test_gh_gets_the_token_only_in_its_environment_and_it_is_revoked() -> None:
 def test_gh_revokes_even_when_gh_fails_and_passes_its_exit_code() -> None:
     f = Fakes()
     f.gh_code = 5
-    assert agent.gh(gh_args("pr", "list", "-R", "jasonluther/partygame"), ctx(), f.deps()) == 5
+    assert agent.gh(gh_args("pr", "list", "-R", "jasonluther/demo-app"), ctx(), f.deps()) == 5
     assert f.sends[-1][0] == "DELETE"
 
 
 def test_a_failed_revoke_warns_without_the_token() -> None:
     f = Fakes(revoke_status=401)
     c = ctx()
-    agent.gh(gh_args("pr", "list", "-R", "jasonluther/partygame"), c, f.deps())
+    agent.gh(gh_args("pr", "list", "-R", "jasonluther/demo-app"), c, f.deps())
     assert "could not be revoked" in err(c)
     assert TOKEN not in printed(c)
 
@@ -246,14 +246,14 @@ def test_no_app_named_is_a_usage_error() -> None:
     c = ctx()
     c.environ = {"KEYS_REAL_GH": "/x/gh"}
     with pytest.raises(UsageError, match="--app"):
-        agent.gh(gh_args("pr", "list", "-R", "jasonluther/partygame"), c, Fakes().deps())
+        agent.gh(gh_args("pr", "list", "-R", "jasonluther/demo-app"), c, Fakes().deps())
 
 
 def test_no_key_in_the_keychain_names_install_key() -> None:
     f = Fakes()
     f.keychain = None
     with pytest.raises(agent.AgentError, match="keys install-key kilotronic-agents"):
-        agent.gh(gh_args("pr", "list", "-R", "jasonluther/partygame"), ctx(), f.deps())
+        agent.gh(gh_args("pr", "list", "-R", "jasonluther/demo-app"), ctx(), f.deps())
 
 
 def test_the_real_gh_skips_the_keys_shim(tmp_path: Path) -> None:
@@ -391,7 +391,7 @@ def test_a_real_openssl_signs_over_the_pipes(tmp_path: Path) -> None:
         (["pr", "list", "-Rkilotronic/keys"], None, ("kilotronic", "keys")),
         (
             ["repo", "clone", "kilotronic/keys"],
-            "https://github.com/jasonluther/partygame",
+            "https://github.com/jasonluther/demo-app",
             ("kilotronic", "keys"),
         ),
         (["release", "view", "kilotronic/keys"], None, ("kilotronic", "keys")),
@@ -411,7 +411,7 @@ def test_more_ways_of_naming_the_repo(
 def test_an_unreadable_repo_flag_fails_rather_than_guessing() -> None:
     with pytest.raises(UsageError, match="-R"):
         agent.target(
-            ["pr", "list", "-R", "not a repo"], {}, "https://github.com/jasonluther/partygame"
+            ["pr", "list", "-R", "not a repo"], {}, "https://github.com/jasonluther/demo-app"
         )
 
 
@@ -461,8 +461,8 @@ def test_the_token_is_limited_to_the_one_repo() -> None:
 
     deps = f.deps()
     deps.send = send
-    agent.gh(gh_args("pr", "list", "-R", "jasonluther/partygame"), ctx(), deps)
-    assert json.loads(bodies[0] or b"{}") == {"repositories": ["partygame"]}
+    agent.gh(gh_args("pr", "list", "-R", "jasonluther/demo-app"), ctx(), deps)
+    assert json.loads(bodies[0] or b"{}") == {"repositories": ["demo-app"]}
 
 
 def test_an_owner_flag_mints_a_token_for_the_whole_installation() -> None:
@@ -501,7 +501,7 @@ def test_keys_gh_reaching_itself_stops() -> None:
     f = Fakes()
     with pytest.raises(agent.AgentError, match="reached itself"):
         agent.gh(
-            gh_args("pr", "list", "-R", "jasonluther/partygame"),
+            gh_args("pr", "list", "-R", "jasonluther/demo-app"),
             ctx(environ={"KEYS_GH_ACTIVE": "1"}),
             f.deps(),
         )
@@ -510,7 +510,7 @@ def test_keys_gh_reaching_itself_stops() -> None:
 
 def test_the_child_is_told_it_runs_under_keys_gh() -> None:
     f = Fakes()
-    agent.gh(gh_args("pr", "list", "-R", "jasonluther/partygame"), ctx(), f.deps())
+    agent.gh(gh_args("pr", "list", "-R", "jasonluther/demo-app"), ctx(), f.deps())
     assert f.gh_calls[0][1]["KEYS_GH_ACTIVE"] == "1"
 
 
@@ -543,7 +543,7 @@ def test_each_owner_gets_its_own_app() -> None:
     f = Fakes(installed={"acme-corp": 9, "jasonluther": 7})
     agent.gh(gh_args("pr", "list", "-R", "acme-corp/widgets"), map_only(), f.deps())
     first = _keychain_services(f)
-    agent.gh(gh_args("pr", "list", "-R", "jasonluther/partygame"), map_only(), f.deps())
+    agent.gh(gh_args("pr", "list", "-R", "jasonluther/demo-app"), map_only(), f.deps())
     second = _keychain_services(f)[len(first) :]
     assert first
     assert all("acme-agents" in s for s in first)
