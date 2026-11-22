@@ -74,7 +74,13 @@ class Fakes:
         return self.gh_code
 
     def deps(self) -> agent.Deps:
-        return agent.Deps(run=self.run, send=self.send, now=lambda: 1_000_000, exec_gh=self.exec_gh)
+        return agent.Deps(
+            run=self.run,
+            send=self.send,
+            now=lambda: 1_000_000,
+            exec_gh=self.exec_gh,
+            platform="darwin",
+        )
 
 
 class TTY(io.StringIO):
@@ -333,6 +339,44 @@ def test_the_key_reaches_the_keychain_on_stdin_never_argv() -> None:
     assert PEM not in " ".join(argv)
     assert "MIIfake" not in " ".join(argv)
     assert base64.b64encode(PEM.encode()).decode() in (stdin or b"").decode()
+
+
+def test_off_a_mac_the_key_goes_to_a_file_only_its_owner_can_read(tmp_path: Path) -> None:
+    f = Fakes()
+    deps = f.deps()
+    deps.platform, deps.key_dir = "linux", tmp_path / "app-keys"
+    agent.store_key("kilotronic-agents", agent.Secret(PEM), "Iv23clientid", deps)
+    path = tmp_path / "app-keys" / "kilotronic-agents.json"
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert path.parent.stat().st_mode & 0o777 == 0o700
+    assert not f.runs  # no `security`, no child at all
+    pem, client_id = agent.load_key("kilotronic-agents", deps)
+    assert pem == agent.Secret(PEM)
+    assert client_id == "Iv23clientid"
+    assert [p.name for p in path.parent.iterdir()] == [path.name]  # no temporary file left
+
+
+def test_a_key_file_others_can_read_is_refused(tmp_path: Path) -> None:
+    deps = Fakes().deps()
+    deps.platform, deps.key_dir = "linux", tmp_path
+    agent.store_key("kilotronic-agents", agent.Secret(PEM), "Iv23clientid", deps)
+    (tmp_path / "kilotronic-agents.json").chmod(0o644)
+    with pytest.raises(agent.AgentError, match="readable by others") as e:
+        agent.load_key("kilotronic-agents", deps)
+    assert "MIIfake" not in str(e.value)
+
+
+def test_a_missing_or_foreign_key_file_names_install_key(tmp_path: Path) -> None:
+    deps = Fakes().deps()
+    deps.platform, deps.key_dir = "linux", tmp_path
+    with pytest.raises(agent.AgentError, match="keys install-key kilotronic-agents"):
+        agent.load_key("kilotronic-agents", deps)
+    bad = tmp_path / "kilotronic-agents.json"
+    bad.write_text('{"pem": "MIIfake"}')
+    bad.chmod(0o600)
+    with pytest.raises(agent.AgentError, match="not one install-key wrote") as e:
+        agent.load_key("kilotronic-agents", deps)
+    assert "MIIfake" not in str(e.value)
 
 
 def test_a_client_id_that_could_break_the_keychain_line_is_refused() -> None:
@@ -639,7 +683,9 @@ def test_git_credential_quits_on_an_unexpected_failure() -> None:
         raise RuntimeError("unexpected")
 
     deps = f.deps()
-    deps = agent.Deps(run=deps.run, send=boom, now=deps.now, exec_gh=deps.exec_gh)
+    deps = agent.Deps(
+        run=deps.run, send=boom, now=deps.now, exec_gh=deps.exec_gh, platform="darwin"
+    )
     c = map_only(stdin=GIT_IN.format(path="acme-corp/widgets.git"))
     with pytest.raises(RuntimeError):
         agent.git_credential(argparse.Namespace(app=None, operation="get"), c, deps)
@@ -660,3 +706,40 @@ def test_a_crafted_owner_is_refused_on_every_app_source() -> None:
     with pytest.raises(UsageError):
         agent.gh(gh_args("api", "https://github.com/..%2Fusers/x", app="k-agents"), ctx(), f.deps())
     assert f.sends == []
+
+
+def test_has_key_answers_by_exit_code_and_prints_nothing(tmp_path: Path) -> None:
+    deps = Fakes().deps()
+    deps.platform, deps.key_dir = "linux", tmp_path
+    c = map_only()
+    ns = argparse.Namespace(name="kilotronic-agents")
+    assert agent.has_key(ns, c, deps) == agent.EXIT_FAIL
+    agent.store_key("kilotronic-agents", agent.Secret(PEM), "Iv23clientid", deps)
+    assert agent.has_key(ns, c, deps) == agent.EXIT_OK
+    assert out(c) == ""
+    f = Fakes()
+    f.keychain = None
+    assert agent.has_key(ns, c, f.deps()) == agent.EXIT_FAIL
+
+
+def test_a_relative_xdg_config_home_is_ignored(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", ".config")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    deps = agent.Deps(platform="linux")
+    path = agent._key_file("kilotronic-agents", deps)  # pyright: ignore[reportPrivateUsage]
+    assert path == tmp_path / ".config" / "keys" / "app-keys" / "kilotronic-agents.json"
+
+
+def test_a_key_file_that_is_a_link_is_refused(tmp_path: Path) -> None:
+    deps = Fakes().deps()
+    deps.platform, deps.key_dir = "linux", tmp_path / "real"
+    agent.store_key("kilotronic-agents", agent.Secret(PEM), "Iv23clientid", deps)
+    (tmp_path / "linked").mkdir()
+    (tmp_path / "linked" / "kilotronic-agents.json").symlink_to(
+        tmp_path / "real" / "kilotronic-agents.json"
+    )
+    deps.key_dir = tmp_path / "linked"
+    with pytest.raises(agent.AgentError, match="could not read"):
+        agent.load_key("kilotronic-agents", deps)

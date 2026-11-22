@@ -592,7 +592,10 @@ Agents sign in to GitHub as an App instead of the owner's own login (design: the
 
 - `keys install-key <name>` copies a `github-app-key` credential's private key and client id from
   1Password into one login-keychain item (`keys:<name>`), through `security -i` on stdin, so
-  minting never asks for Touch ID. It then signs in as the App once to prove the key.
+  minting never asks for Touch ID. Off a Mac (Linux has no login keychain) it writes them instead
+  to `~/.config/keys/app-keys/<name>.json` (`$XDG_CONFIG_HOME` if set): the folder `0700`, the file
+  `0600`, written under a temporary name and renamed into place; `keys gh` refuses a key file
+  anyone else can read. It then signs in as the App once to prove the key.
 - `keys gh [--app NAME] -- <gh args>` mints a one-hour installation token for the call's owner
   (from `-R`, `--repo=`, `$GH_REPO`, a github.com URL, a `gh api` path, `--owner` (as
   `gh project` takes it; the token then covers the whole installation), `$KEYS_GH_OWNER` (for a

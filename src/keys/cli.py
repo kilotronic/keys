@@ -102,7 +102,13 @@ def _parser(ctx: Context, argv: Sequence[str]) -> _Parser:
     )
     rotating.configure(add("rotate", "replace a credential end to end: make, store, sync, revoke"))
     agent.configure_install(
-        add("install-key", "copy a GitHub App key from 1Password into the login keychain, once")
+        add(
+            "install-key",
+            "copy a GitHub App key from 1Password into the keychain (off a Mac, a file), once",
+        )
+    )
+    agent.configure_has_key(
+        add("has-key", "exit 0 when this machine holds an App's key install-key wrote, else 1")
     )
     agent.configure_gh(
         add("gh", "run gh as the agents' GitHub App, with a token minted for the call")
@@ -139,6 +145,8 @@ def run(argv: Sequence[str], ctx: Context) -> int:
     try:
         if command == "install-key":
             return agent.install(args, ctx)
+        if command == "has-key":
+            return agent.has_key(args, ctx)
         if command == "gh":
             return agent.gh(args, ctx)
         if command == "git-credential":
