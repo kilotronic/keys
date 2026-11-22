@@ -55,8 +55,8 @@ jobs:
           domains: ixid.net, kilotronic.com
           commit-subject: true
 
-  # ruff, pyright (strict) and the tests, the canary tests among them. zsh is installed so the
-  # canary's shell-history check runs through a real interactive shell, as on the owner's Mac.
+  # pyright (strict) and the tests, the canary tests among them (ruff runs in the prek job). zsh is
+  # installed so the canary's shell-history check runs through a real interactive shell, as on the owner's Mac.
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -74,8 +74,6 @@ jobs:
       - name: Install zsh
         run: sudo apt-get update -q && sudo apt-get install -y -q zsh
       - run: uv sync --frozen
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
       - run: uv run pyright
       - run: uv run pytest
 

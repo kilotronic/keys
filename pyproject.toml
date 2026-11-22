@@ -11,7 +11,8 @@ dependencies = []
 keys = "keys.cli:entry"
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.14", "pyright>=1.1.400"]
+# ruff is not a dev dependency: it runs from the shared hooks (prek), at one pinned version.
+dev = ["pytest>=8", "pyright>=1.1.400"]
 
 [build-system]
 requires = ["hatchling>=1.33.0"]
