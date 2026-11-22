@@ -33,7 +33,7 @@ jobs:
       - name: Install zsh
         run: sudo apt-get update -q && sudo apt-get install -y -q zsh
       - run: uv sync --frozen
-      - uses: kilotronic/checks/red-on-logic@a6e8917fddb679077a2e8a427598ff1fd7a160ef # v1.0.0
+      - uses: kilotronic/checks/red-on-logic@1bc3a9cd7c8875e77799faae6774f6f8eec50207 # v1.0.1
         with:
           # keys' own words for a name the old code does not know: an option, a command or
           # a provider the branch adds. Failing on them is red on import, not a wrong answer.
