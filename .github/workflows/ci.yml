@@ -38,7 +38,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: kilotronic/lint@b5343bfa69d890919c8774733da372d13d23d6d3 # v1.3.1
+      - uses: kilotronic/lint@56a43d45e7b4479bba97c79404a4dc7671bd9796 # v1.3.2
 
   # Real authors on this event's commits, in the owner's domains, from kilotronic/git-identity.
   git-identity:
@@ -56,8 +56,8 @@ jobs:
           allow-bots: dependabot
           commit-subject: true
 
-  # pyright (strict) and the tests (ruff runs once, in the prek job), the canary tests among them. zsh is installed so the
-  # canary's shell-history check runs through a real interactive shell, as on the owner's Mac.
+  # pyright (strict) and the tests, the canary tests among them (ruff runs in the prek job). zsh is
+  # installed so the canary's shell-history check runs through a real interactive shell, as on the owner's Mac.
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
