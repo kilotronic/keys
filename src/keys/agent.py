@@ -2,8 +2,10 @@
 
 The App's private key goes from 1Password into one login-keychain item on a Mac (elsewhere, a
 file only its owner can read, under ~/.config/keys/app-keys), once, so minting needs no Touch ID.
-Each `keys gh` call mints a one-hour installation token for the repo's owner, hands it to the real
-gh only in gh's environment, and revokes it when gh ends. `keys git-credential` answers git's
+Each `keys gh` call mints a one-hour installation token for the repo's owner (limited to the one
+repo the call names or runs in; a GraphQL or `gh project` call, which can reach any of the owner's
+repos, gets the whole installation), hands it to the real gh only in gh's environment, and
+revokes it when gh ends. `keys git-credential` answers git's
 credential protocol on a pipe. An owner with no installation fails with a message naming it;
 nothing ever falls back to the owner's own sign-in, and no value is printed, nor written anywhere
 but that one keychain item or key file.
@@ -315,10 +317,26 @@ def _split(pair: str, *, extra: bool = False) -> tuple[str, str | None] | None:
     return None
 
 
+def spans_repos(args: Sequence[str]) -> bool:
+    """A call whose reach no one repo bounds: GraphQL (`gh api graphql`), which names objects by
+    node id in any of the owner's repos, and `gh project`, whose boards hold issues from any."""
+    if args[:1] == ["project"]:
+        return True
+    return args[:1] == ["api"] and any(a in ("graphql", "/graphql") for a in args[1:])
+
+
 def target(
     args: Sequence[str], environ: Mapping[str, str], origin: str | None
 ) -> tuple[str, str | None]:
-    """The owner (and repo, if known) a gh call acts on."""
+    """The owner (and repo, if known) a gh call acts on. A call that spans repos takes only the
+    owner, so its token covers the owner's whole installation rather than the repo it ran in."""
+    owner, repo = _target(args, environ, origin)
+    return (owner, None) if spans_repos(args) else (owner, repo)
+
+
+def _target(
+    args: Sequence[str], environ: Mapping[str, str], origin: str | None
+) -> tuple[str, str | None]:
     args = list(args)
     for i, a in enumerate(args):
         given = None
