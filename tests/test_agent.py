@@ -527,6 +527,51 @@ def test_an_owner_flag_mints_a_token_for_the_whole_installation() -> None:
     assert not any("/repos/" in u for _, u, _ in calls)
 
 
+@pytest.mark.parametrize(
+    ("args", "env"),
+    [
+        # GraphQL names objects by node id, which can sit in any repo of the owner's: linking an
+        # issue in one repo as a sub-issue of an issue in another.
+        (["api", "graphql", "-f", "query=mutation { addSubIssue }"], {}),
+        (["api", "-X", "POST", "/graphql", "-F", "issueId=I_x"], {}),
+        (["api", "graphql", "-f", "query={ viewer { login } }"], {"GH_REPO": "jasonluther/lib"}),
+        # A board's item can hold an issue from any repo; item-edit names no owner of its own.
+        (["project", "item-edit", "--id", "PVTI_x", "--project-id", "PVT_y"], {}),
+    ],
+)
+def test_a_call_that_spans_repos_takes_the_owner_not_the_current_repo(
+    args: list[str], env: dict[str, str]
+) -> None:
+    origin = "git@github.com:jasonluther/demo-app.git"
+    assert agent.target(args, env, origin) == ("jasonluther", None)
+
+
+def test_a_rest_call_in_a_repo_still_takes_only_that_repo() -> None:
+    origin = "git@github.com:jasonluther/demo-app.git"
+    assert agent.target(["api", "repos/{owner}/{repo}/issues"], {}, origin) == (
+        "jasonluther",
+        "demo-app",
+    )
+    assert agent.target(["issue", "view", "3"], {}, origin) == ("jasonluther", "demo-app")
+
+
+def test_graphql_in_a_repo_checkout_mints_for_the_whole_installation() -> None:
+    f = Fakes()
+    calls: list[tuple[str, str, bytes | None]] = []
+    original = f.send
+
+    def send(method: str, url: str, headers: dict[str, str], data: bytes | None) -> Answer:
+        calls.append((method, url, data))
+        return original(method, url, headers, data)
+
+    deps = f.deps()
+    deps.send = send
+    agent.gh(gh_args("api", "graphql", "-f", "query={ viewer { login } }"), ctx(), deps)
+    posts = [(u, d) for m, u, d in calls if m == "POST"]
+    assert json.loads(posts[0][1] or b"{}") == {}
+    assert not any("/repos/" in u for _, u, _ in calls)
+
+
 def test_an_lfs_path_names_its_repo() -> None:
     f = Fakes()
     c = ctx(stdin="protocol=https\nhost=github.com\npath=jasonluther/agents.git/info/lfs\n\n")

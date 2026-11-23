@@ -607,9 +607,13 @@ Agents sign in to GitHub as an App instead of the owner's own login (design: the
   (from `-R`, `--repo=`, `$GH_REPO`, a github.com URL, a `gh api` path, `--owner` (as
   `gh project` takes it; the token then covers the whole installation), `$KEYS_GH_OWNER` (for a
   call that names no owner, such as `gh project item-edit`: set it once for a script), the current
-  repo's `origin`, else `$KEYS_GH_DEFAULT_OWNER`), runs the real `gh` with it as `GH_TOKEN` in gh's
-  environment only (dropping `GITHUB_TOKEN` and `GITHUB_PERSONAL_ACCESS_TOKEN`), and revokes it
-  when gh ends. `gh auth token|login|refresh|switch` are refused. The real `gh` is
+  repo's `origin`, else `$KEYS_GH_DEFAULT_OWNER`). When the call names a repo or runs in one, the
+  token covers only that repo. A GraphQL call (`gh api graphql`) and any `gh project` call take
+  only the owner from those sources and get the whole installation: GraphQL names objects by node
+  id, which can sit in any of the owner's repos (linking an issue in one repo as a sub-issue of an
+  issue in another), and a board holds issues from any repo, so no one repo can bound them. It
+  runs the real `gh` with the token as `GH_TOKEN` in gh's environment only (dropping
+  `GITHUB_TOKEN` and `GITHUB_PERSONAL_ACCESS_TOKEN`), and revokes it when gh ends. `gh auth token|login|refresh|switch` are refused. The real `gh` is
   `$KEYS_REAL_GH`, else the first `gh` on `PATH` that is not a shim calling `keys gh`.
 - `keys git-credential [--app NAME] get` answers git's credential protocol for
   `https://github.com` with `credential.useHttpPath` on, picking the path's owner; it refuses a
