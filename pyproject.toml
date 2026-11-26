@@ -1,6 +1,6 @@
 [project]
 name = "keys"
-version = "0.2.0"
+version = "0.3.0"
 description = "Credentials kept out of transcripts: list, check, scan and create keys without ever printing a value."
 readme = "README.md"
 license = "MIT"
