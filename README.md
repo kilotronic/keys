@@ -190,6 +190,18 @@ plain name, or looks like a value, is printed as `<name withheld>`. In CI, `gh` 
 `GH_TOKEN`, which needs read access to the repos' secrets and environments (and the
 organisation's secrets, for an org target).
 
+A GitHub App's installation token reaches only one owner's repos, so a mapping file with targets
+under more than one owner takes a token per owner: `KEYS_GH_TOKEN_<OWNER>`, the owner's name in
+upper case with dashes as underscores (`KEYS_GH_TOKEN_ACME_CORP` for `acme-corp`). For a target
+under that owner, `gh` gets it as `GH_TOKEN`, with gh's other token variables dropped, and never
+sees the `KEYS_GH_TOKEN_` variable itself; an owner with none set, or set empty, uses `GH_TOKEN`.
+`keys sync` and `keys rotate` pick it the same way for every `gh` call about that owner's repos
+(the secret, and for rotate the Environment's rules and the verify run), and `keys gh` never
+passes a `KEYS_GH_TOKEN_` variable on. Per-owner tokens are for github.com: with `GH_HOST` set
+to an Enterprise Server host, gh ignores `GH_TOKEN` and uses its own sign-in there. On github.com
+an owner's name is letters, digits and dashes, so each has its own variable; an Enterprise
+Managed Users handle (`name_short`) could share one with another owner.
+
 ### `keys scan`
 
 Searches the places an agent's or a shell's words are kept, all of them backed up and outliving
@@ -613,7 +625,7 @@ Agents sign in to GitHub as an App instead of the owner's own login (design: the
   id, which can sit in any of the owner's repos (linking an issue in one repo as a sub-issue of an
   issue in another), and a board holds issues from any repo, so no one repo can bound them. It
   runs the real `gh` with the token as `GH_TOKEN` in gh's environment only (dropping
-  `GITHUB_TOKEN` and `GITHUB_PERSONAL_ACCESS_TOKEN`), and revokes it when gh ends. `gh auth token|login|refresh|switch` are refused. The real `gh` is
+  `GITHUB_TOKEN`, `GITHUB_PERSONAL_ACCESS_TOKEN` and any `KEYS_GH_TOKEN_` variable), and revokes it when gh ends. `gh auth token|login|refresh|switch` are refused. The real `gh` is
   `$KEYS_REAL_GH`, else the first `gh` on `PATH` that is not a shim calling `keys gh`.
 - `keys git-credential [--app NAME] get` answers git's credential protocol for
   `https://github.com` with `credential.useHttpPath` on, picking the path's owner; it refuses a

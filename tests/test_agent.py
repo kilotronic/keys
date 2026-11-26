@@ -201,7 +201,12 @@ def test_no_owner_at_all_is_a_usage_error() -> None:
 def test_gh_gets_the_token_only_in_its_environment_and_it_is_revoked() -> None:
     f = Fakes()
     c = ctx(
-        environ={"GITHUB_PERSONAL_ACCESS_TOKEN": "owner-admin", "GITHUB_TOKEN": "x", "HOME": "/h"}
+        environ={
+            "GITHUB_PERSONAL_ACCESS_TOKEN": "owner-admin",
+            "GITHUB_TOKEN": "x",
+            "KEYS_GH_TOKEN_DEMO_ORG": "y",
+            "HOME": "/h",
+        }
     )
     code = agent.gh(gh_args("pr", "list", "-R", "jasonluther/demo-app"), c, f.deps())
     assert code == 0
@@ -210,6 +215,7 @@ def test_gh_gets_the_token_only_in_its_environment_and_it_is_revoked() -> None:
     assert env["GH_TOKEN"] == TOKEN
     assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in env
     assert "GITHUB_TOKEN" not in env
+    assert "KEYS_GH_TOKEN_DEMO_ORG" not in env  # the nightly check's per-owner tokens, not gh's
     assert env["HOME"] == "/h"
     assert f.sends[-1][0] == "DELETE"
     assert TOKEN not in printed(c)

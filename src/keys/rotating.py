@@ -245,8 +245,12 @@ class Rotation:
         except OpError as e:
             raise UsageError(f"could not read {self.c.name}'s 1Password item: {e}") from None
 
-    def gh(self, step: int, what: str, argv: list[str], timeout: int = proc.TIMEOUT_S) -> str:
-        env = proc.child_env(self.environ, names=targets.ENV_NAMES["gh"])
+    def gh(
+        self, step: int, what: str, argv: list[str], repo: str, timeout: int = proc.TIMEOUT_S
+    ) -> str:
+        """A gh call about repo, with its owner's token (targets.gh_environ)."""
+        environ = targets.gh_environ(self.environ, repo.split("/", 1)[0])
+        env = proc.child_env(environ, names=targets.ENV_NAMES["gh"])
         try:
             done = proc.run(argv, env, timeout=timeout)
         except proc.ChildError as e:
@@ -310,7 +314,7 @@ class Rotation:
 
         def read(path: str) -> dict[str, Any]:
             try:
-                out = self.gh(1, what, ["gh", "api", path])
+                out = self.gh(1, what, ["gh", "api", path], repo)
             except StepError:
                 raise StepError(
                     1,
@@ -797,7 +801,7 @@ class Rotation:
 
     def _runs(self, repo: str, wf: str) -> list[int]:
         argv = ["gh", "run", "list", "--repo", repo, "--workflow", wf, "--limit", "20"]
-        out = self.gh(6, "listing runs", [*argv, "--json", "databaseId,event,headBranch"])
+        out = self.gh(6, "listing runs", [*argv, "--json", "databaseId,event,headBranch"], repo)
         try:
             rows = cast(list[Any], json.loads(out or "[]"))
         except ValueError:
@@ -818,6 +822,7 @@ class Rotation:
             6,
             "dispatching the workflow",
             ["gh", "workflow", "run", wf, "--repo", repo, "--ref", "main"],
+            repo,
         )
         run_id = None
         for attempt in range(RUN_LOOKS):
@@ -831,7 +836,11 @@ class Rotation:
             raise StepError(6, f"the run {wf} was dispatched, but keys could not find it")
         argv = ["gh", "run", "watch", str(run_id), "--repo", repo, "--interval", "60"]
         self.gh(
-            6, f"watching {wf}: the run did not pass", [*argv, "--exit-status"], WATCH_TIMEOUT_S
+            6,
+            f"watching {wf}: the run did not pass",
+            [*argv, "--exit-status"],
+            repo,
+            WATCH_TIMEOUT_S,
         )
 
     def rollback(

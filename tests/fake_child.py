@@ -350,10 +350,23 @@ def _under(db: dict[str, Any], prefix: str) -> dict[str, dict[str, Any]]:
     }
 
 
+def _gh_token_ok(w: list[str], flags: dict[str, str | bool], db: dict[str, Any]) -> bool:
+    """An installation token reaches one owner's repos: with gh_tokens set, a call about an
+    owner it names needs that owner's token in GH_TOKEN, as GitHub answers for an App."""
+    scope = _flag(flags, "--org") or _flag(flags, "--repo")
+    if not scope and w[:2] == ["gh", "api"] and len(w) == 3 and w[2].startswith("repos/"):
+        scope = w[2].split("/")[1]
+    wanted = db.get("gh_tokens", {}).get(scope.split("/")[0])
+    return wanted is None or os.environ.get("GH_TOKEN") == wanted
+
+
 def targets(
     prog: str, words: list[str], flags: dict[str, str | bool], stdin: str, db: dict[str, Any]
 ) -> int | None:
     w = [prog, *words]
+    if prog == "gh" and not _gh_token_ok(w, flags, db):
+        print("HTTP 404: Not Found", file=sys.stderr)
+        return 1
     if w[:3] == ["gh", "secret", "set"] and len(w) == 4:
         meta = {"visibility": _flag(flags, "--visibility"), "repos": _flag(flags, "--repos")}
         # gh trims a value read from stdin of its trailing line breaks.

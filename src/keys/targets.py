@@ -186,8 +186,36 @@ class Adapter:
         raise TargetError(f"{self.program} printed something keys cannot read {what}")
 
 
+# gh's own sign-in variables, replaced together when keys picks the owner's token.
+GH_TOKENS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+
+
+def owner_token_variable(owner: str) -> str:
+    """The variable holding one owner's GitHub token: KEYS_GH_TOKEN_ and the owner, upper case,
+    dashes as underscores (a GitHub owner's name is letters, digits and dashes)."""
+    return "KEYS_GH_TOKEN_" + owner.upper().replace("-", "_")
+
+
+def gh_environ(environ: Mapping[str, str], owner: str) -> Mapping[str, str]:
+    """environ for a gh call about one owner's repos. A GitHub App's installation token reaches
+    one owner's repos, so a run across owners takes one token each: $KEYS_GH_TOKEN_<OWNER> as
+    GH_TOKEN when set (gh's other token variables dropped), else environ as it is."""
+    token = environ.get(owner_token_variable(owner), "")
+    if not token:
+        return environ
+    kept = {k: v for k, v in environ.items() if k not in GH_TOKENS}
+    return {**kept, "GH_TOKEN": token}
+
+
 class _GitHub(Adapter):
     program = "gh"
+
+    def __init__(self, t: mapping.Target, environ: Mapping[str, str], where: str) -> None:
+        super().__init__(t, environ, where)
+        self.environ = gh_environ(environ, self.owner())
+
+    def owner(self) -> str:
+        return self.f("repo").split("/", 1)[0]
 
     def _scope_flags(self) -> list[str]:
         raise NotImplementedError
@@ -236,6 +264,9 @@ class GitHubEnv(_GitHub):
 
 
 class GitHubOrg(_GitHub):
+    def owner(self) -> str:
+        return self.f("org")
+
     def _scope_flags(self) -> list[str]:
         return ["--org", self.f("org")]
 
