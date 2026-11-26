@@ -393,6 +393,13 @@ def targets(
         db.setdefault("watched", []).append(int(w[3]))
         return int(db.get("run_result", 0))
     if w[:3] == ["gh", "secret", "list"]:
+        # An installation token reaches one owner's repos: with gh_tokens set, a listing of an
+        # owner it names needs that owner's token in GH_TOKEN, as GitHub answers for an App.
+        scope = str(_flag(flags, "--org") or _flag(flags, "--repo") or "")
+        wanted = db.get("gh_tokens", {}).get(scope.split("/")[0])
+        if wanted is not None and os.environ.get("GH_TOKEN") != wanted:
+            print("HTTP 404: Not Found", file=sys.stderr)
+            return 1
         prefix = target_key("gh", flags, "")
         rows = [{"name": n, "updatedAt": v["updated_at"]} for n, v in _under(db, prefix).items()]
         print(json.dumps(rows))

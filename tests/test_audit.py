@@ -304,6 +304,79 @@ def test_github_names_compare_without_case(c: Canary) -> None:
     assert "github-actions owner/app mail_key  present" in out
 
 
+TWO_OWNERS = """
+[[credential.target]]
+type = "github-actions"
+repo = "owner/app"
+secret = "MAIL_KEY"
+
+[[credential.target]]
+type = "github-actions-env"
+repo = "other-org/site"
+environment = "production"
+secret = "MAIL_KEY"
+
+[[credential.target]]
+type = "github-actions-org"
+org = "other-org"
+secret = "MAIL_KEY"
+visibility = "private"
+"""
+TOKEN_OWNER = "token-for-owner-made-up"
+TOKEN_OTHER = "token-for-other-org-made-up"
+
+
+def two_owners(c: Canary) -> None:
+    write_mapping(c, body=TWO_OWNERS)
+    after = "2026-11-02T10:00:00Z"
+    c.target_put("gh:owner/app:MAIL_KEY", CANARY, updated_at=after)
+    c.target_put("gh:other-org/site:env:production:MAIL_KEY", CANARY, updated_at=after)
+    c.target_put("gh:org:other-org:MAIL_KEY", CANARY, updated_at=after)
+    c.set_db("gh_tokens", {"owner": TOKEN_OWNER, "other-org": TOKEN_OTHER})
+
+
+def test_each_github_owner_is_listed_with_its_own_token(c: Canary) -> None:
+    # An App's installation token reaches one owner's repos, so a check across two owners
+    # takes a token per owner: KEYS_GH_TOKEN_<OWNER>, upper case, dashes as underscores.
+    two_owners(c)
+    env = {"GH_TOKEN": TOKEN_OWNER, "KEYS_GH_TOKEN_OTHER_ORG": TOKEN_OTHER}
+    result = c.run(["check", "--all"], env={**ENV, **env}, today=lambda: TODAY)
+    assert result.code == 0, result.stdout + result.stderr
+    assert "github-actions-env other-org/site env:production MAIL_KEY  present" in result.stdout
+    assert "github-actions-org other-org MAIL_KEY  present" in result.stdout
+    for text in (result.stdout, result.stderr):
+        assert TOKEN_OWNER not in text
+        assert TOKEN_OTHER not in text
+    for ch in c.children():  # gh gets the chosen token as GH_TOKEN, never the keys variable
+        if ch.prog == "gh":
+            assert "GH_TOKEN" in ch.env
+            assert not [n for n in ch.env if n.startswith("KEYS_GH_TOKEN_")]
+
+
+def test_an_owner_with_no_token_of_its_own_uses_gh_token(c: Canary) -> None:
+    two_owners(c)
+    env = {"GH_TOKEN": TOKEN_OWNER}
+    result = c.run(["check", "--all"], env={**ENV, **env}, today=lambda: TODAY)
+    assert result.code == 1
+    assert "github-actions owner/app MAIL_KEY  present" in result.stdout
+    assert "other-org/site env:production MAIL_KEY  cannot list: gh exited 1" in result.stdout
+
+
+def test_an_owner_token_overrides_gh_token_for_that_owner_only(c: Canary) -> None:
+    two_owners(c)
+    env = {
+        "GH_TOKEN": TOKEN_OTHER,
+        "KEYS_GH_TOKEN_OWNER": TOKEN_OWNER,
+        "GITHUB_TOKEN": "another-token-made-up",
+    }
+    result = c.run(["check", "--all"], env={**ENV, **env}, today=lambda: TODAY)
+    assert result.code == 0, result.stdout + result.stderr
+    listings = [ch for ch in c.children() if ch.argv[:3] == ["gh", "secret", "list"]]
+    owner = [ch for ch in listings if "owner/app" in ch.argv]
+    assert owner
+    assert all("GITHUB_TOKEN" not in ch.env for ch in owner)  # only the chosen one
+
+
 def test_key_vault_names_compare_without_case(c: Canary) -> None:
     body = (
         '[[credential.target]]\ntype = "azure-key-vault"\nvault = "app-kv"\nsecret = "Mail-Key"\n'

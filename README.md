@@ -190,6 +190,13 @@ plain name, or looks like a value, is printed as `<name withheld>`. In CI, `gh` 
 `GH_TOKEN`, which needs read access to the repos' secrets and environments (and the
 organisation's secrets, for an org target).
 
+A GitHub App's installation token reaches only one owner's repos, so a mapping file with targets
+under more than one owner takes a token per owner: `KEYS_GH_TOKEN_<OWNER>`, the owner's name in
+upper case with dashes as underscores (`KEYS_GH_TOKEN_ACME_CORP` for `acme-corp`). For a target
+under that owner, `gh` gets it as `GH_TOKEN`, with gh's other token variables dropped, and never
+sees the `KEYS_GH_TOKEN_` variable itself; an owner with none set, or set empty, uses `GH_TOKEN`.
+`keys sync` and `keys rotate` write a GitHub target's secret with the token picked the same way.
+
 ### `keys scan`
 
 Searches the places an agent's or a shell's words are kept, all of them backed up and outliving
