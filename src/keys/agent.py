@@ -634,7 +634,11 @@ def gh(args: argparse.Namespace, ctx: Context, deps: Deps | None = None) -> int:
     if repo is not None and not REPO.fullmatch(repo):
         raise UsageError("the repo is not a GitHub repository name")
     token = mint(_app(args, ctx, owner), owner, repo, deps)
-    env = {k: v for k, v in ctx.environ.items() if k not in DROP}
+    env = {
+        k: v
+        for k, v in ctx.environ.items()
+        if k not in DROP and not k.startswith("KEYS_GH_TOKEN_")  # the per-owner tokens
+    }
     env["GH_TOKEN"] = token.reveal()
     env["KEYS_GH_ACTIVE"] = "1"
     try:

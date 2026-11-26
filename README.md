@@ -195,7 +195,11 @@ under more than one owner takes a token per owner: `KEYS_GH_TOKEN_<OWNER>`, the 
 upper case with dashes as underscores (`KEYS_GH_TOKEN_ACME_CORP` for `acme-corp`). For a target
 under that owner, `gh` gets it as `GH_TOKEN`, with gh's other token variables dropped, and never
 sees the `KEYS_GH_TOKEN_` variable itself; an owner with none set, or set empty, uses `GH_TOKEN`.
-`keys sync` and `keys rotate` write a GitHub target's secret with the token picked the same way.
+`keys sync` and `keys rotate` pick it the same way for every `gh` call about that owner's repos
+(the secret, and for rotate the Environment's rules and the verify run), and `keys gh` never
+passes a `KEYS_GH_TOKEN_` variable on. On github.com an owner's name is letters, digits and
+dashes, so each has its own variable; an Enterprise Managed Users handle (`name_short`) could
+share one with another owner.
 
 ### `keys scan`
 

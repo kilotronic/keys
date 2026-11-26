@@ -196,18 +196,23 @@ def owner_token_variable(owner: str) -> str:
     return "KEYS_GH_TOKEN_" + owner.upper().replace("-", "_")
 
 
-class _GitHub(Adapter):
-    """A GitHub App's installation token reaches one owner's repos, so a check across owners
-    takes one token each: $KEYS_GH_TOKEN_<OWNER> when set, else gh's own GH_TOKEN."""
+def gh_environ(environ: Mapping[str, str], owner: str) -> Mapping[str, str]:
+    """environ for a gh call about one owner's repos. A GitHub App's installation token reaches
+    one owner's repos, so a run across owners takes one token each: $KEYS_GH_TOKEN_<OWNER> as
+    GH_TOKEN when set (gh's other token variables dropped), else environ as it is."""
+    token = environ.get(owner_token_variable(owner), "")
+    if not token:
+        return environ
+    kept = {k: v for k, v in environ.items() if k not in GH_TOKENS}
+    return {**kept, "GH_TOKEN": token}
 
+
+class _GitHub(Adapter):
     program = "gh"
 
     def __init__(self, t: mapping.Target, environ: Mapping[str, str], where: str) -> None:
         super().__init__(t, environ, where)
-        token = environ.get(owner_token_variable(self.owner()), "")
-        if token:
-            kept = {k: v for k, v in environ.items() if k not in GH_TOKENS}
-            self.environ = {**kept, "GH_TOKEN": token}
+        self.environ = gh_environ(environ, self.owner())
 
     def owner(self) -> str:
         return self.f("repo").split("/", 1)[0]

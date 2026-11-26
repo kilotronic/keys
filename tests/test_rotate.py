@@ -394,6 +394,41 @@ def test_a_failed_sync_puts_the_old_key_back_everywhere(cf: tuple[Canary, Provid
     assert c.target(KV)["tags"] == {"keys-fp": fp(CANARY)}  # type: ignore[index]
 
 
+def test_rotate_reaches_a_github_owner_with_its_own_token(canary: Canary) -> None:
+    # The Environment's rules (step 1), the secret (step 5) and the verify run (step 6) all
+    # take the owner's KEYS_GH_TOKEN_<OWNER>; GH_TOKEN here belongs to another owner.
+    c = canary
+    c.watch(FP_KEY)
+    minter = made_up("mint")
+    c.op_item(VAULT, CF_ITEM, {"credential": CANARY, "token_id": "cf-old", "account_id": ""})
+    c.op_item(VAULT, MINTER_ITEM, {"credential": minter, "token_id": "cf-mint", "account_id": ""})
+    c.never_written.append(minter)
+    c.gh_main_only("owner/app", "production")
+    c.target_put(GH_ENV, CANARY)
+    c.target_put("gh:owner/app:CF", CANARY)
+    (c.work / "keys.toml").write_text(
+        CF_MAPPING.split("[[credential.target]]")[0]
+        + '[[credential.target]]\ntype = "github-actions-env"\nrepo = "owner/app"\n'
+        'environment = "production"\nsecret = "CLOUDFLARE_API_TOKEN"\n\n'
+        '[[credential.target]]\ntype = "github-actions"\nrepo = "owner/app"\nsecret = "CF"\n'
+        'verify = { workflow = "deploy.yml" }\n'
+    )
+    p = Providers(c)
+    p.add("cloudflare", CANARY, "cf-old", policies=POLICIES, condition=CONDITION, name="deploy")
+    p.add("cloudflare", minter, "cf-mint", can_mint=True)
+    c.set_db("gh_tokens", {"owner": "owner-token-made-up"})
+    env = {**ENV, "GH_TOKEN": "another-owner-token-made-up"}
+    env["KEYS_GH_TOKEN_OWNER"] = "owner-token-made-up"
+    result = c.run(["rotate", "deploy"], env=env, send=p, today=lambda: TODAY)
+    assert result.code == 0, result.stderr
+    new = new_value(p)
+    assert c.target(GH_ENV)["value"] == new  # type: ignore[index]
+    assert c.target("gh:owner/app:CF")["value"] == new  # type: ignore[index]
+    gh = [ch for ch in c.children() if ch.prog == "gh"]
+    assert [ch for ch in gh if ch.argv[:3] == ["gh", "run", "watch"]]
+    assert not [n for ch in gh for n in ch.env if n.startswith("KEYS_GH_TOKEN_")]
+
+
 def test_a_failed_verify_puts_the_old_key_back(canary: Canary) -> None:
     c = canary
     c.watch(FP_KEY)
