@@ -4,3 +4,8 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 dist/
+
+# Secrets: never commit local environment files
+.env
+.env.*
+!.env.example
